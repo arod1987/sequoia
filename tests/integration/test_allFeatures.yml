@@ -61,18 +61,6 @@
    duration: 3600  # 1 hour of main loader
    command: "kv --ops {{.Scale 2000}} --create 15 --get 80 --delete 5  --hosts {{.Orchestrator}} --bucket {{.Bucket}} --sizes 512 128 1024 2048"
 
-
-#============ start view queries  ============
--
-  # run http attacks against view with various skip param
-  foreach: "{{range $i, $view := strlist `stats` `array` `padd`}}"
-  template: attack_view
-  args: "0, 10, {{$.NthDataNode $i}},
-         {{$.Bucket}},
-         scale,
-         {{$view}},
-         limit={{$.Scale 10}}&stale=update_after&connection_timeout=60000"
-
 #============ rebalance out a node============
 -
   template: rebalance_out

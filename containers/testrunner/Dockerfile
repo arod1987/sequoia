@@ -15,6 +15,7 @@ WORKDIR /
 RUN git clone git://github.com/couchbase/testrunner.git
 WORKDIR testrunner
 ARG BRANCH=master
+RUN git stash
 RUN git checkout $BRANCH
 
 # install python deps

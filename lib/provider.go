@@ -5,14 +5,16 @@ package sequoia
  */
 
 import (
+	"context"
 	"fmt"
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/fsouza/go-dockerclient"
-	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"io/ioutil"
+
+	"github.com/docker/docker/api/types/swarm"
+	"github.com/fsouza/go-dockerclient"
 )
 
 type ProviderLabel int
@@ -26,9 +28,13 @@ const ( // iota is reset to 0
 
 const UBUNTU_OS_DIR = "Ubuntu14"
 const CENTOS_OS_DIR = "CentOS7"
+const DEFAULT_DOCKER_PROVIDER_CONF = "providers/docker/options.yml"
 
 type Provider interface {
-	ProvideCouchbaseServers(servers []ServerSpec)
+	ProvideCouchbaseServers(filename *string, servers []ServerSpec)
+	ProvideSyncGateways(syncGateways []SyncGatewaySpec)
+	ProvideAccels(accels []AccelSpec)
+	ProvideLoadBalancer(loadBalancer LoadBalancerSpec)
 	GetHostAddress(name string) string
 	GetType() string
 	GetRestUrl(name string) string
@@ -36,11 +42,13 @@ type Provider interface {
 
 type FileProvider struct {
 	Servers      []ServerSpec
+	SyncGateways []SyncGatewaySpec
 	ServerNameIp map[string]string
 	HostFile     string
 }
 type ClusterRunProvider struct {
 	Servers      []ServerSpec
+	SyncGateways []SyncGatewaySpec
 	ServerNameIp map[string]string
 	Endpoint     string
 }
@@ -48,9 +56,14 @@ type ClusterRunProvider struct {
 type DockerProvider struct {
 	Cm               *ContainerManager
 	Servers          []ServerSpec
+	SyncGateways     []SyncGatewaySpec
+	Accels           []AccelSpec
+	LoadBalancer     LoadBalancerSpec
 	ActiveContainers map[string]string
 	StartPort        int
 	Opts             *DockerProviderOpts
+	ExposePorts      bool
+	UseNetwork       bool
 }
 
 type SwarmProvider struct {
@@ -58,43 +71,91 @@ type SwarmProvider struct {
 }
 
 type DockerProviderOpts struct {
-	Build            string
-	BuildUrlOverride string `yaml:"build_url_override"`
-	CPUPeriod        int64
-	CPUQuota         int64
-	Memory           int64
-	MemorySwap       int64
-	OS               string
-	Ulimits          []docker.ULimit
+	Build              string
+	SyncGatewayVersion string `yaml:"sync_gateway_version"`
+	AccelVersion       string `yaml:"accel_version"`
+	BuildUrlOverride   string `yaml:"build_url_override"`
+	CPUPeriod          int64
+	CPUQuota           int64
+	Memory             int64
+	MemorySwap         int64
+	OS                 string
+	Ulimits            []docker.ULimit
 }
 
 func (opts *DockerProviderOpts) MemoryMB() int {
 	return int(opts.Memory / 1000000) // B -> MB
 }
 
-func NewProvider(flags TestFlags, servers []ServerSpec) Provider {
+func NewProvider(flags TestFlags, servers []ServerSpec, syncGateways []SyncGatewaySpec, accels []AccelSpec, loadBalancer LoadBalancerSpec) Provider {
 	var provider Provider
 	providerArgs := strings.Split(*flags.Provider, ":")
+	startPort := 8091
 
 	switch providerArgs[0] {
 	case "docker":
-		cm := NewContainerManager(*flags.Client, "docker")
-		provider = &DockerProvider{
-			cm,
-			servers,
-			make(map[string]string),
-			8091,
-			nil,
+
+		// Create network if specified
+		network := *flags.Network
+		useNetwork := false
+		cm := NewContainerManager(*flags.Client, "docker", network)
+		if network != "" {
+			cm.CreateNetwork(network)
+			useNetwork = true
+		}
+
+		if cm.ProviderType == "swarm" { // detected docker client is in a swarm
+			provider = &SwarmProvider{
+				DockerProvider{
+					cm,
+					servers,
+					syncGateways,
+					accels,
+					loadBalancer,
+					make(map[string]string),
+					startPort,
+					nil,
+					*flags.ExposePorts,
+					useNetwork,
+				},
+			}
+		} else {
+			provider = &DockerProvider{
+				cm,
+				servers,
+				syncGateways,
+				accels,
+				loadBalancer,
+				make(map[string]string),
+				startPort,
+				nil,
+				*flags.ExposePorts,
+				useNetwork,
+			}
 		}
 	case "swarm":
-		cm := NewContainerManager(*flags.Client, "swarm")
+
+		// TODO: implement network on Swarm
+		network := *flags.Network
+		if network != "" {
+			panic("Docker network not implemented on Swarm")
+		}
+
+		cm := NewContainerManager(*flags.Client, "swarm", "")
+
 		provider = &SwarmProvider{
 			DockerProvider{
 				cm,
 				servers,
+				syncGateways,
+				accels,
+				loadBalancer,
 				make(map[string]string),
-				8091,
-				nil},
+				startPort,
+				nil,
+				*flags.ExposePorts,
+				false,
+			},
 		}
 	case "file":
 		hostFile := "default.yml"
@@ -103,6 +164,7 @@ func NewProvider(flags TestFlags, servers []ServerSpec) Provider {
 		}
 		provider = &FileProvider{
 			servers,
+			syncGateways,
 			make(map[string]string),
 			hostFile,
 		}
@@ -113,6 +175,7 @@ func NewProvider(flags TestFlags, servers []ServerSpec) Provider {
 		}
 		provider = &ClusterRunProvider{
 			servers,
+			syncGateways,
 			make(map[string]string),
 			endpoint,
 		}
@@ -132,7 +195,7 @@ func (p *FileProvider) GetRestUrl(name string) string {
 	return p.GetHostAddress(name) + ":8091"
 }
 
-func (p *FileProvider) ProvideCouchbaseServers(servers []ServerSpec) {
+func (p *FileProvider) ProvideCouchbaseServers(filename *string, servers []ServerSpec) {
 	var hostNames string
 	hostFile := fmt.Sprintf("providers/file/%s", p.HostFile)
 	ReadYamlFile(hostFile, &hostNames)
@@ -146,6 +209,56 @@ func (p *FileProvider) ProvideCouchbaseServers(servers []ServerSpec) {
 			i++
 		}
 	}
+}
+
+func (p *FileProvider) ProvideSyncGateways(syncGateways []SyncGatewaySpec) {
+	// If user specifies FileProvider and includes a Sync Gateway Spec
+	// lookup yml keys prefixed with 'syncgateway'
+	var hostNames string
+	hostFile := fmt.Sprintf("providers/file/%s", p.HostFile)
+	ReadYamlFile(hostFile, &hostNames)
+	hosts := strings.Split(hostNames, " ")
+	gatewayHosts := []string{}
+	for _, host := range hosts {
+		parts := strings.Split(host, ",")
+		prefix := parts[0]
+		if prefix == "syncgateway" {
+			if len(parts) > 1 {
+				ip := parts[1]
+				gatewayHosts = append(gatewayHosts, ip)
+			}
+		}
+	}
+
+	// provide an ip for each gateway
+	for _, syncGateway := range syncGateways {
+
+		syncGatewayNameList := ExpandServerName(syncGateway.Name, syncGateway.Count, syncGateway.CountOffset+1)
+		for _, syncGatewayName := range syncGatewayNameList {
+
+			var i int
+			if i < len(gatewayHosts) {
+				p.ServerNameIp[syncGatewayName] = gatewayHosts[i]
+			}
+			i++
+		}
+
+	}
+
+}
+
+// ProvideSyncGateways should work with FileProvider (TODO)
+func (p *FileProvider) ProvideAccels(accels []AccelSpec) {
+	// If user specifies FileProvider and includes a Sync Gateway Spec, panic
+	// until this is supported
+	if len(accels) > 0 {
+		panic("Unsupported provider (FileProvider) for Accel")
+	}
+}
+
+// ProvideLoadBalancer should work with FileProvider (TODO)
+func (p *FileProvider) ProvideLoadBalancer(loadBalancer LoadBalancerSpec) {
+	// TODO
 }
 
 func (p *ClusterRunProvider) GetType() string {
@@ -170,7 +283,7 @@ func (p *ClusterRunProvider) GetRestUrl(name string) string {
 	return "<no_host>"
 }
 
-func (p *ClusterRunProvider) ProvideCouchbaseServers(servers []ServerSpec) {
+func (p *ClusterRunProvider) ProvideCouchbaseServers(filename *string, servers []ServerSpec) {
 	var i int
 	for _, server := range servers {
 		for _, name := range server.Names {
@@ -181,12 +294,34 @@ func (p *ClusterRunProvider) ProvideCouchbaseServers(servers []ServerSpec) {
 	}
 }
 
+// ProvideSyncGateways should work with ClusterRunProvider (TODO)
+func (p *ClusterRunProvider) ProvideSyncGateways(syncGateways []SyncGatewaySpec) {
+	// If user specifies FileProvider and includes a Accel Spec, panic
+	// until this is supported
+	if len(syncGateways) > 0 {
+		panic("Unsupported provider (ClusterRunProvider) for Accel")
+	}
+}
+
+// ProvideAccels should work with ClusterRunProvider (TODO)
+func (p *ClusterRunProvider) ProvideAccels(accels []AccelSpec) {
+	// If user specifies FileProvider and includes a Accel Spec, panic
+	// until this is supported
+	if len(accels) > 0 {
+		panic("Unsupported provider (ClusterRunProvider) for Accel")
+	}
+}
+
+// ProvideLoadBalancer should work with ClusterRunProvider (TODO)
+func (p *ClusterRunProvider) ProvideLoadBalancer(loadBalancer LoadBalancerSpec) {
+	// TODO
+}
+
 func (p *DockerProvider) GetType() string {
-	return "docker"
+	return p.Cm.ProviderType
 }
 
 func (p *DockerProvider) GetHostAddress(name string) string {
-	var ipAddress string
 
 	id, ok := p.ActiveContainers[name]
 	if ok == false {
@@ -202,9 +337,16 @@ func (p *DockerProvider) GetHostAddress(name string) string {
 	}
 	container, err := p.Cm.Client.InspectContainer(id)
 	chkerr(err)
-	ipAddress = container.NetworkSettings.IPAddress
 
-	return ipAddress
+	var host string
+	if !p.UseNetwork {
+		host = container.NetworkSettings.IPAddress
+	} else {
+		// strip the prefix "/"
+		host = container.Name[1:]
+	}
+
+	return host
 }
 
 func (p *DockerProvider) NumCouchbaseServers() int {
@@ -220,16 +362,20 @@ func (p *DockerProvider) NumCouchbaseServers() int {
 	return count
 }
 
-func (p *DockerProvider) ProvideCouchbaseServers(servers []ServerSpec) {
+func (p *DockerProvider) ProvideCouchbaseServers(filename *string, servers []ServerSpec) {
 
 	var providerOpts DockerProviderOpts
-	ReadYamlFile("providers/docker/options.yml", &providerOpts)
+	if filename == nil || len(*filename) == 0 {
+		*filename = DEFAULT_DOCKER_PROVIDER_CONF
+
+	}
+	ReadYamlFile(*filename, &providerOpts)
 	p.Opts = &providerOpts
 	var build = p.Opts.Build
 
 	// start based on number of containers
 	var i int = p.NumCouchbaseServers()
-	p.StartPort = 8091 + i
+	p.StartPort += i
 	for _, server := range servers {
 		serverNameList := ExpandServerName(server.Name, server.Count, server.CountOffset+1)
 
@@ -244,8 +390,11 @@ func (p *DockerProvider) ProvideCouchbaseServers(servers []ServerSpec) {
 			var portBindings = make(map[docker.Port][]docker.PortBinding)
 			portBindings[port] = binding
 			hostConfig := docker.HostConfig{
-				PortBindings: portBindings,
-				Ulimits:      p.Opts.Ulimits,
+				Ulimits:    p.Opts.Ulimits,
+				Privileged: true,
+			}
+			if p.ExposePorts == true {
+				hostConfig.PortBindings = portBindings
 			}
 
 			if p.Opts.CPUPeriod > 0 {
@@ -306,6 +455,226 @@ func (p *DockerProvider) ProvideCouchbaseServers(servers []ServerSpec) {
 	}
 }
 
+// BuildMobileContainer will check to see if local image is already built
+// for "syncgateway" or "accel" product given the versions provided via options
+// If the image does not exist locally, sequoia will build it
+func (p *DockerProvider) BuildMobileContainer(options *DockerProviderOpts, product string) docker.Config {
+
+	var osPath = ""
+	if options.OS == "centos7" {
+		osPath = CENTOS_OS_DIR
+	} else {
+		panic("Sync Gateway only supports Centos7 for now")
+	}
+
+	var version string
+	if product == "syncgateway" {
+		version = options.SyncGatewayVersion
+	} else if product == "accel" {
+		version = options.AccelVersion
+	} else {
+		panic("Unsupported Mobile product: Should be 'syncgateway' or 'accel'")
+	}
+
+	imgName := fmt.Sprintf("%s_%s.%s",
+		product,
+		version,
+		strings.ToLower(osPath))
+
+	exists := p.Cm.CheckImageExists(imgName)
+
+	if exists == false {
+
+		var buildArgs = BuildArgsForMobileVersion(version)
+		var contextDir = fmt.Sprintf("containers/%s/%s/", product, osPath)
+		var buildOpts = docker.BuildImageOptions{
+			Name:           imgName,
+			ContextDir:     contextDir,
+			SuppressOutput: false,
+			Pull:           false,
+			BuildArgs:      buildArgs,
+		}
+
+		// build image
+		err := p.Cm.BuildImage(buildOpts)
+		logerr(err)
+	}
+
+	config := docker.Config{
+		Image: imgName,
+	}
+
+	return config
+
+}
+
+// StartMobileContainer will run the following steps
+//  1. Get Couchbase Server url from the first host.
+//  2. Start the Sync Gateway pointing at Couchbase Server
+//
+//  IMPORTANT: This should only be called once we know there are at
+//    least one Couchbase Server running.
+func (p *DockerProvider) StartMobileContainer(containerName string, config docker.Config) string {
+
+	// If network is not provided, link pairs so that the Sync Gateway container can talk to server
+	var linkPairs []string
+	if !p.UseNetwork {
+		linkPairsString := p.GetLinkPairs()
+		linkPairs = strings.Split(linkPairsString, ",")
+	} else {
+		linkPairs = []string{}
+	}
+
+	hostConfig := docker.HostConfig{
+		Privileged: true,
+		Links:      linkPairs,
+	}
+
+	// Run SG container detached
+	ctx := context.Background()
+	options := docker.CreateContainerOptions{
+		Name:       containerName,
+		Config:     &config,
+		HostConfig: &hostConfig,
+		Context:    ctx,
+	}
+
+	// Start the container
+	_, container := p.Cm.RunContainer(options)
+	p.ActiveContainers[container.Name] = container.ID
+	colorsay(fmt.Sprintf("starting http://%s:4984", container.Name))
+
+	return container.ID
+}
+
+// ProvideSyncGateways will build and start all sync gateway containers
+func (p *DockerProvider) ProvideSyncGateways(syncGateways []SyncGatewaySpec) {
+
+	var providerOpts DockerProviderOpts
+	ReadYamlFile("providers/docker/options.yml", &providerOpts)
+
+	// Check to see if the container exists locally. Build if it is not present
+	config := p.BuildMobileContainer(&providerOpts, "syncgateway")
+
+	for _, syncGateway := range syncGateways {
+
+		syncGatewayNameList := ExpandServerName(syncGateway.Name, syncGateway.Count, syncGateway.CountOffset+1)
+
+		for _, syncGatewayName := range syncGatewayNameList {
+
+			// Start the containers
+			containerID := p.StartMobileContainer(syncGatewayName, config)
+
+			// Get the ip address of the first server in the group
+			cbsURL := p.Servers[0].Names[0]
+
+			// Mode is required to write the Sync Gateway config for
+			// "di" = distributed index modes (Accels)
+			// "cc" = channel cache mode (Standalone)
+			var mode string
+			if len(p.Accels) > 0 {
+				mode = "di"
+			} else {
+				mode = "cc"
+			}
+
+			// Start Sync Gateway service
+			cmd := []string{"./entrypoint.sh", cbsURL, mode}
+			colorsay(fmt.Sprintf("exec %s on %s", cmd, containerID))
+			p.Cm.ExecContainer(containerID, cmd, true)
+		}
+	}
+}
+
+// ProvideAccels will build and start all sync gateway containers
+func (p *DockerProvider) ProvideAccels(accels []AccelSpec) {
+
+	var providerOpts DockerProviderOpts
+	ReadYamlFile("providers/docker/options.yml", &providerOpts)
+
+	// Check to see if the container exists locally. Build if it is not present
+	config := p.BuildMobileContainer(&providerOpts, "accel")
+
+	for _, accel := range accels {
+
+		accelNameList := ExpandServerName(accel.Name, accel.Count, accel.CountOffset+1)
+
+		for _, accelName := range accelNameList {
+
+			// Start the containers
+			containerID := p.StartMobileContainer(accelName, config)
+
+			// Get the ip address of the first server in the group
+			cbsURL := p.Servers[0].Names[0]
+
+			// Start Sync Gateway service
+			cmd := []string{"./entrypoint.sh", cbsURL}
+			colorsay(fmt.Sprintf("exec %s on %s", cmd, containerID))
+			p.Cm.ExecContainer(containerID, cmd, true)
+		}
+	}
+}
+
+// ProvideLoadBalancer should work with SwarmProvider (TODO)
+func (p *DockerProvider) ProvideLoadBalancer(loadBalancer LoadBalancerSpec) {
+	// TODO
+	if loadBalancer.Name != "" {
+
+		// Pull image if it does not exist
+		imgName := "nginx"
+		exists := p.Cm.CheckImageExists(imgName)
+		if !exists {
+			p.Cm.PullImage(imgName)
+		}
+
+		// Read template nginx config and Add Sync Gateway endpoint
+		bytes, err := ioutil.ReadFile("containers/syncgateway/nginx.conf.j2.template")
+		chkerr(err)
+
+		// Build string of Sync Gateway endpoints
+		var syncGatewayEndpoints string
+		var syncGatewayAdminEndpoints string
+		for _, syncGateway := range p.SyncGateways {
+			for _, syncGatewayName := range syncGateway.Names {
+				colorsay(fmt.Sprintf("Adding %s:4984 to load balancer", syncGatewayName))
+				syncGatewayEndpoints += fmt.Sprintf("server %s:4984;\n", syncGatewayName)
+				syncGatewayAdminEndpoints += fmt.Sprintf("server %s:4985;\n", syncGatewayName)
+			}
+		}
+
+		// Render the Sync Gateway enpoints
+		nginxConf := string(bytes)
+		nginxConf = strings.Replace(nginxConf, "PUBLIC_UPSTREAM_SYNCGATEWAYS", syncGatewayEndpoints, -1)
+		nginxConf = strings.Replace(nginxConf, "ADMIN_UPSTREAM_SYNCGATEWAYS", syncGatewayAdminEndpoints, -1)
+
+		// Write the rendered file
+		err = ioutil.WriteFile("containers/syncgateway/nginx.conf.j2", []byte(nginxConf), 0644)
+		chkerr(err)
+
+		// Run the nginx container
+		volumes := BuildVolumes("containers/syncgateway/nginx.conf.j2:/etc/nginx/nginx.conf:ro")
+
+		// Setup container options
+		config := docker.Config{
+			Image: imgName,
+		}
+
+		hostConfig := docker.HostConfig{
+			Binds: volumes,
+		}
+
+		opts := docker.CreateContainerOptions{
+			Name:       loadBalancer.Name,
+			Config:     &config,
+			HostConfig: &hostConfig,
+		}
+
+		// Run the load balancer
+		colorsay("Running nginx load balancer")
+		p.Cm.RunContainer(opts)
+	}
+}
+
 func (p *SwarmProvider) ProvideCouchbaseServer(serverName string, portOffset int, zone string) {
 
 	var build = p.Opts.Build
@@ -318,17 +687,23 @@ func (p *SwarmProvider) ProvideCouchbaseServer(serverName string, portOffset int
 	}
 
 	portConfig := []swarm.PortConfig{
-		swarm.PortConfig{
-			TargetPort:    8091,
-			PublishedPort: uint32(portOffset),
-		},
+		swarm.PortConfig{},
+	}
+
+	if p.ExposePorts {
+		portConfig[0].TargetPort = 8091
+		portConfig[0].PublishedPort = uint32(portOffset)
 	}
 
 	var portBindings = make(map[docker.Port][]docker.PortBinding)
 	portBindings[port] = binding
 	hostConfig := docker.HostConfig{
-		PortBindings: portBindings,
-		Ulimits:      p.Opts.Ulimits,
+		Ulimits:    p.Opts.Ulimits,
+		Privileged: true,
+	}
+
+	if p.ExposePorts {
+		hostConfig.PortBindings = portBindings
 	}
 
 	if p.Opts.CPUPeriod > 0 {
@@ -373,7 +748,7 @@ func (p *SwarmProvider) ProvideCouchbaseServer(serverName string, portOffset int
 	serviceName := strings.Replace(serverName, ".", "-", -1)
 	containerSpec := swarm.ContainerSpec{Image: imgName}
 	placement := swarm.Placement{Constraints: []string{"node.labels.zone == " + zone}}
-	taskSpec := swarm.TaskSpec{ContainerSpec: containerSpec, Placement: &placement}
+	taskSpec := swarm.TaskSpec{ContainerSpec: &containerSpec, Placement: &placement}
 	annotations := swarm.Annotations{Name: serviceName}
 	endpointSpec := swarm.EndpointSpec{Ports: portConfig}
 	spec := swarm.ServiceSpec{
@@ -386,17 +761,21 @@ func (p *SwarmProvider) ProvideCouchbaseServer(serverName string, portOffset int
 		ServiceSpec: spec,
 	}
 
-	_, container := p.Cm.RunContainerAsService(options, 30)
+	_, container, _ := p.Cm.RunContainerAsService(options, 30)
 	p.ActiveContainers[serverName] = container.ID
 
 	colorsay("start couchbase http://" + p.GetRestUrl(serverName))
 }
 
-func (p *SwarmProvider) ProvideCouchbaseServers(servers []ServerSpec) {
+func (p *SwarmProvider) ProvideCouchbaseServers(filename *string, servers []ServerSpec) {
+
+	if filename == nil || len(*filename) == 0 {
+		*filename = DEFAULT_DOCKER_PROVIDER_CONF
+	}
 
 	// read provider options
 	var providerOpts DockerProviderOpts
-	ReadYamlFile("providers/docker/options.yml", &providerOpts)
+	ReadYamlFile(*filename, &providerOpts)
 	p.Opts = &providerOpts
 
 	// start based on number of containers
@@ -408,9 +787,12 @@ func (p *SwarmProvider) ProvideCouchbaseServers(servers []ServerSpec) {
 		for _, serverName := range serverNameList {
 			port := 8091 + i
 
-			// determin zone based on service
+			// determine zone based on service
 			services := server.NodeServices[serverName]
 			zone := services[0]
+			if p.Cm.NumClients() == 1 {
+				zone = "client" // override for single host swarm
+			}
 			go p.ProvideCouchbaseServer(serverName, port, zone)
 			i++
 			j++
@@ -423,15 +805,38 @@ func (p *SwarmProvider) ProvideCouchbaseServers(servers []ServerSpec) {
 	time.Sleep(time.Second * 5)
 }
 
+// ProvideSyncGateways should work with Swarm (TODO)
+func (p *SwarmProvider) ProvideSyncGateways(syncGateways []SyncGatewaySpec) {
+	// If user specifies FileProvider and includes a Sync Gateway Spec, panic
+	// until this is supported
+	if len(syncGateways) > 0 {
+		panic("Unsupported provider (SwarmProvider) for Sync Gateway")
+	}
+}
+
+// ProvideAccels should work with Swarm (TODO)
+func (p *SwarmProvider) ProvideAccels(accels []AccelSpec) {
+	// If user specifies FileProvider and includes a Accel Spec, panic
+	// until this is supported
+	if len(accels) > 0 {
+		panic("Unsupported provider (SwarmProvider) for Accel")
+	}
+}
+
+// ProvideLoadBalancer should work with SwarmProvider (TODO)
+func (p *SwarmProvider) ProvideLoadBalancer(loadBalancer LoadBalancerSpec) {
+	// TODO
+}
+
 func (p *SwarmProvider) GetHostAddress(name string) string {
 	var ipAddress string
 
 	id, ok := p.ActiveContainers[name]
 	client := p.Cm.ClientForContainer(id)
 	if ok == false {
-		// look up container by name
+		// look up container by name if not known
 		filter := make(map[string][]string)
-		filter["name"] = []string{name}
+		filter["id"] = []string{id}
 		opts := docker.ListContainersOptions{
 			Filters: filter,
 		}
@@ -439,6 +844,7 @@ func (p *SwarmProvider) GetHostAddress(name string) string {
 		chkerr(err)
 		id = containers[0].ID
 	}
+
 	container, err := client.InspectContainer(id)
 	chkerr(err)
 	ipAddress = container.NetworkSettings.Networks["ingress"].IPAddress
@@ -447,47 +853,19 @@ func (p *SwarmProvider) GetHostAddress(name string) string {
 }
 
 func (p *SwarmProvider) GetRestUrl(name string) string {
+	// get ip address of the container and format as rest url
 
-	var restUrl string
+	retry := 5
+	address := p.GetHostAddress(name)
+	for address == "" && retry > 0 {
+		// retry if ip was not found
 
-	// get port
-	port := p.StartPort
-	offset := 0
-	for _, spec := range p.Servers {
-		for _, server := range spec.Names {
-			if server == name {
-				port = port + offset
-				break
-			}
-			offset += 1
-		}
+		time.Sleep(time.Second * 3)
+		address = p.GetHostAddress(name)
+		retry -= 1
 	}
-
-	// get server for this container
-
-	containerID := p.ActiveContainers[name]
-	client := p.Cm.ClientForContainer(containerID)
-
-	clientEndpoint := client.Endpoint()
-	// extract host from endpoint
-	url, err := url.Parse(clientEndpoint)
-	if url.Scheme == "" {
-		url, err = url.Parse("http://" + clientEndpoint)
-	}
-	chkerr(err)
-	host := url.Host
-	if host == "" {
-		host = "localhost"
-	}
-
-	// remove port if specified
-	re := regexp.MustCompile(`:.*`)
-	host = re.ReplaceAllString(host, "")
-
-	// attempt to connect
-	restUrl = fmt.Sprintf("%s:%d", host, port)
-
-	return strings.TrimSpace(restUrl)
+	addr := fmt.Sprintf("%s:8091", address)
+	return addr
 }
 
 func (p *SwarmProvider) GetType() string {
@@ -504,32 +882,29 @@ func (p *DockerProvider) GetLinkPairs() string {
 
 func (p *DockerProvider) GetRestUrl(name string) string {
 
-	// extract host from endpoint
-	url, err := url.Parse(p.Cm.Endpoint)
-	if url.Scheme == "" {
-		url, err = url.Parse("http://" + p.Cm.Endpoint)
+	addr := fmt.Sprintf("%s:8091", p.GetHostAddress(name))
+	return addr
+}
+
+func BuildArgsForMobileVersion(version string) []docker.BuildArg {
+
+	var buildArgs []docker.BuildArg
+	version_parts := strings.Split(version, "-")
+
+	var ver = version_parts[0]
+	var build = version_parts[1]
+
+	var buildNoArg = docker.BuildArg{
+		Name:  "BUILD_NO",
+		Value: build,
 	}
-	chkerr(err)
-	host := url.Host
-	if host == "" {
-		host = "localhost"
+	var versionArg = docker.BuildArg{
+		Name:  "VERSION",
+		Value: ver,
 	}
 
-	// remove port if specified
-	re := regexp.MustCompile(`:.*`)
-	host = re.ReplaceAllString(host, "")
-	port := p.StartPort
-	step := len(p.Servers)
-	for i, spec := range p.Servers {
-		for j, server := range spec.Names {
-			if server == name {
-				port = port + i + j*step
-			}
-		}
-	}
-
-	host = fmt.Sprintf("%s:%d\n", host, port)
-	return strings.TrimSpace(host)
+	buildArgs = []docker.BuildArg{versionArg, buildNoArg}
+	return buildArgs
 }
 
 func BuildArgsForVersion(opts *DockerProviderOpts) []docker.BuildArg {

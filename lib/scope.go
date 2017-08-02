@@ -14,11 +14,12 @@ package sequoia
 
 import (
 	"fmt"
-	"github.com/streamrail/concurrent-map"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/streamrail/concurrent-map"
 )
 
 type Scope struct {
@@ -29,6 +30,7 @@ type Scope struct {
 	Version  string
 	Vars     cmap.ConcurrentMap
 	Loops    int
+	Rest     RestClient
 }
 
 func ApplyOverrides(overrides string, spec *ScopeSpec) {
@@ -87,7 +89,7 @@ func NewScope(flags TestFlags, cm *ContainerManager) Scope {
 	}
 
 	// create provider of resources for scope
-	provider := NewProvider(flags, spec.Servers)
+	provider := NewProvider(flags, spec.Servers, spec.SyncGateways, spec.Accels, spec.LoadBalancer)
 
 	// update defaults from spec based on provider
 	for i, _ := range spec.Servers {
@@ -118,11 +120,20 @@ func NewScope(flags TestFlags, cm *ContainerManager) Scope {
 				spec.Servers[i].QueryPort = "8093"
 			}
 		}
+		if spec.Servers[i].FTSPort == "" {
+			if provider.GetType() == "dev" {
+				spec.Servers[i].FTSPort = fmt.Sprintf("%d", 9200+i)
+			} else {
+				spec.Servers[i].FTSPort = "8094"
+			}
+		}
 	}
 	var loops = 0
 	if *flags.Continue == true {
 		loops++ // we've already done first pass
 	}
+
+	rest := NewRestClient(spec.Servers, provider, cm)
 
 	return Scope{
 		spec,
@@ -132,19 +143,34 @@ func NewScope(flags TestFlags, cm *ContainerManager) Scope {
 		"",
 		cmap.New(),
 		loops,
+		rest,
 	}
 }
 
-func (s *Scope) Setup() {
-
-	s.WaitForNodes()
+func (s *Scope) SetupServer() {
+	s.WaitForServers()
+	s.InitRestContainer()
 	s.InitCli()
 	s.InitNodes()
 	s.InitCluster()
+	s.AddUsers()
 	s.AddNodes()
 	s.RebalanceClusters()
 	s.CreateBuckets()
 	s.CreateViews()
+}
+
+// WriteHostConfig writes a json representation of the topology
+// that is used by mobile testkit to run functional tests
+// against Sync Gateway
+func (s *Scope) WriteHostConfig() {
+	GenerateMobileHostDefinition(s)
+}
+
+func (s *Scope) StartTopologyWatcher() {
+	if s.Rest.IsWatching == false {
+		go s.Rest.WatchForTopologyChanges()
+	}
 }
 
 func (s *Scope) Teardown() {
@@ -153,27 +179,34 @@ func (s *Scope) Teardown() {
 	s.RemoveNodes()
 }
 
+func (s *Scope) InitRestContainer() {
+	// make sure container used for rest calls exists
+	s.Cm.PullImage("appropriate/curl")
+}
+
 func (s *Scope) InitCli() {
 
 	// make sure proper couchbase-cli is used for node init
-	cluster := s.Spec.Servers[0]
-	orchestrator := cluster.Names[0]
-	rest := s.Provider.GetRestUrl(orchestrator)
-	version := GetServerVersion(rest, cluster.RestUsername, cluster.RestPassword)
-	s.Version = version[:3]
+	var version string
+	if s.Flags.Version != nil && (*s.Flags.Version != "") {
+		version = *s.Flags.Version
+	} else {
+		version = s.Rest.GetServerVersion()
+	}
 
+	s.Version = version[:3]
 	// pull cli tag matching version..ie 3.5, 4.1, 4.5
 	// :latest is used if no match found
 	s.Cm.PullTaggedImage("sequoiatools/couchbase-cli", s.Version)
 
 }
 
-func (s *Scope) WaitForNodes() {
+func (s *Scope) WaitForServers() {
 
 	var image = "martin/wait"
 
 	// use martin/wait container to wait for node to listen on port 8091
-	waitForNodesOp := func(name string, server *ServerSpec, done chan bool) {
+	waitForServersOp := func(name string, server *ServerSpec, done chan bool) {
 
 		ip := s.Provider.GetHostAddress(name)
 		ipPort := strings.Split(ip, ":")
@@ -199,7 +232,89 @@ func (s *Scope) WaitForNodes() {
 	}
 
 	// verify nodes
-	s.Spec.ApplyToAllServersAsync(waitForNodesOp)
+	s.Spec.ApplyToAllServersAsync(waitForServersOp)
+}
+
+func (s *Scope) WaitForMobile() {
+
+	var image = "martin/wait"
+
+	// use martin/wait container to wait for Sync Gateway to listen on port 4984
+	waitForSyncGatewaysOp := func(name string, syncGateway *SyncGatewaySpec, done chan bool) {
+
+		ip := s.Provider.GetHostAddress(name)
+		ipPort := strings.Split(ip, ":")
+		if len(ipPort) == 1 {
+			// use default port
+			ip = ip + ":4984"
+		}
+
+		command := []string{"-c", ip, "-t", "120"}
+		desc := "wait for " + ip
+		task := ContainerTask{
+			Describe: desc,
+			Image:    image,
+			Command:  command,
+			Async:    false,
+		}
+		if s.Provider.GetType() == "docker" {
+			task.LinksTo = name
+		}
+
+		s.Cm.Run(&task)
+		done <- true
+	}
+
+	// use martin/wait container to wait for Accel to listen on port 4984
+	waitForAccelsOp := func(name string, accel *AccelSpec, done chan bool) {
+
+		ip := s.Provider.GetHostAddress(name)
+		ipPort := strings.Split(ip, ":")
+		if len(ipPort) == 1 {
+			// use default port
+			ip = ip + ":4985"
+		}
+
+		command := []string{"-c", ip, "-t", "120"}
+		desc := "wait for " + ip
+		task := ContainerTask{
+			Describe: desc,
+			Image:    image,
+			Command:  command,
+			Async:    false,
+		}
+		if s.Provider.GetType() == "docker" {
+			task.LinksTo = name
+		}
+
+		s.Cm.Run(&task)
+		done <- true
+	}
+
+	s.Spec.ApplyToAllSyncGatewayAsync(waitForSyncGatewaysOp)
+	s.Spec.ApplyToAllAccelsAsync(waitForAccelsOp)
+}
+
+func (s *Scope) GetPath(path, name string) string {
+
+	// set data path, or use default if unset
+	dataPath := "/opt/couchbase/var/lib/couchbase/data"
+
+	if s.Provider.GetType() == "dev" {
+
+		devDataPath := fmt.Sprintf("%s/%s", "/tmp/data", name)
+		CreateFile(devDataPath, ".dummy")
+		dataPath = devDataPath
+
+	} else if path != "" {
+
+		// paths cannot be used for docker/swarm providers
+		if s.Provider.GetType() != "docker" && s.Provider.GetType() != "swarm" {
+			dataPath = path
+		}
+	}
+
+	return dataPath
 }
 
 func (s *Scope) InitNodes() {
@@ -214,31 +329,17 @@ func (s *Scope) InitNodes() {
 			"-p", server.RestPassword,
 		}
 
-		// set data path, or use default if unset
-		if server.DataPath != "" {
-			command = append(
-				command,
-				"--node-init-data-path",
-				server.DataPath)
-		} else {
-			command = append(
-				command,
-				"--node-init-data-path",
-				"/opt/couchbase/var/lib/couchbase/data")
-		}
+		server.DataPath = s.GetPath(server.DataPath, name)
+		command = append(
+			command,
+			"--node-init-data-path",
+			server.DataPath)
 
-		// set index path, or use default if unset
-		if server.IndexPath != "" {
-			command = append(
-				command,
-				"--node-init-index-path",
-				server.IndexPath)
-		} else {
-			command = append(
-				command,
-				"--node-init-index-path",
-				"/opt/couchbase/var/lib/couchbase/data")
-		}
+		server.IndexPath = s.GetPath(server.IndexPath, name)
+		command = append(
+			command,
+			"--node-init-index-path",
+			server.IndexPath)
 
 		desc := "init node " + ip
 		task := ContainerTask{
@@ -271,7 +372,7 @@ func (s *Scope) InitCluster() {
 		ramQuota := server.Ram
 		if ramQuota == "" {
 			// use cluster mcdReserved
-			memTotal := s.ClusterMemReserved(name, server)
+			memTotal := s.Rest.GetMemReserved(name)
 			ramQuota = strconv.Itoa(memTotal)
 		}
 		if strings.Index(ramQuota, "%") > -1 {
@@ -294,7 +395,8 @@ func (s *Scope) InitCluster() {
 
 		// make sure if index services is specified that index ram is set
 		if strings.Index(services, "index") > -1 && server.IndexRam == "" {
-			server.IndexRam = strconv.Itoa(s.ClusterIndexQuota(name, server))
+			q := s.Rest.GetIndexQuota(name)
+			server.IndexRam = strconv.Itoa(q)
 		}
 		if server.IndexRam != "" {
 			indexQuota := server.IndexRam
@@ -343,6 +445,60 @@ func (s *Scope) InitCluster() {
 	// apply only to orchestrator
 	s.Spec.ApplyToServers(initClusterOp, 0, 1)
 
+}
+
+func (s *Scope) AddUsers() {
+
+	// spock only
+	if strings.Compare(s.Version, "5.0") == -1 {
+		return
+	}
+
+	var image = "sequoiatools/couchbase-cli"
+
+	// add users
+	operation := func(name string, server *ServerSpec) {
+		orchestrator := server.Names[0]
+		ip := s.Provider.GetHostAddress(orchestrator)
+
+		for _, user := range server.RbacSpecs {
+
+			roles := user.Roles
+			if roles == "" {
+				roles = "admin"
+			}
+
+			// auth_domain can override auth_type
+			auth_domain := user.AuthDomain
+			if auth_domain == "" {
+				auth_domain = "builtin"
+			}
+			command := []string{"user-manage", "-c", ip,
+				"-u", server.RestUsername, "-p", server.RestPassword,
+				"--rbac-username", user.Name,
+				"--rbac-password", user.Password,
+				"--roles", roles,
+				"--auth-domain", auth_domain,
+				"--set",
+			}
+
+			desc := "create rbac user " + user.Name
+			task := ContainerTask{
+				Describe: desc,
+				Image:    image,
+				Command:  command,
+				Async:    false,
+			}
+			if s.Provider.GetType() == "docker" {
+				task.LinksTo = orchestrator
+			}
+
+			s.Cm.Run(&task)
+		}
+	}
+
+	// apply only to orchestrator of each cluster
+	s.Spec.ApplyToServers(operation, 0, 1)
 }
 
 func (s *Scope) AddNodes() {
@@ -462,7 +618,7 @@ func (s *Scope) CreateBuckets() {
 					"--enable-flush", "1", "--wait",
 				}
 				if bucket.Sasl != "" {
-					command = append(command, "--bucket-password", bucket.Sasl)
+					command = append(command, "--password", bucket.Sasl)
 				}
 				if bucket.Eviction != "" {
 					command = append(command, "--bucket-eviction-policy", bucket.Eviction)
@@ -498,26 +654,13 @@ func (s *Scope) GetPercOfMemTotal(name string, server *ServerSpec, quota string)
 }
 
 func (s *Scope) ClusterMemTotal(name string, server *ServerSpec) int {
-	rest := s.Provider.GetRestUrl(name)
-	mem := GetMemTotal(rest, server.RestUsername, server.RestPassword)
+	mem := s.Rest.GetMemTotal(name)
 	if s.Provider.GetType() == "docker" {
 		p := s.Provider.(*DockerProvider)
 		if p.Opts.Memory > 0 {
 			mem = p.Opts.MemoryMB()
 		}
 	}
-	return mem
-}
-
-func (s *Scope) ClusterMemReserved(name string, server *ServerSpec) int {
-	rest := s.Provider.GetRestUrl(name)
-	mem := GetMemReserved(rest, server.RestUsername, server.RestPassword)
-	return mem
-}
-
-func (s *Scope) ClusterIndexQuota(name string, server *ServerSpec) int {
-	rest := s.Provider.GetRestUrl(name)
-	mem := GetIndexQuota(rest, server.RestUsername, server.RestPassword)
 	return mem
 }
 

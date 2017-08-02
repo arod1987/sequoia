@@ -1,12 +1,19 @@
 package sequoia
 
 import (
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net/http"
+	"github.com/streamrail/concurrent-map"
 	"time"
 )
+
+type RestClient struct {
+	Clusters        []ServerSpec
+	Provider        Provider
+	Cm              *ContainerManager
+	TopologyChanged bool
+	nodeCache       cmap.ConcurrentMap
+	IsWatching      bool
+}
 
 type NodeSelf struct {
 	MemoryTotal       int
@@ -19,129 +26,227 @@ type NodeSelf struct {
 	Version           string
 }
 
-type NodeStatuses struct {
-	Statuses map[string]NodeStatus
-}
+type NodeStatuses map[string]NodeStatus
 
 type NodeStatus struct {
-	Status      map[string]string
-	Healthy     map[string]string
-	OtpNode     map[string]string
-	Replication map[string]int
-	Dataless    map[string]bool
+	Status      string
+	OtpNode     string
+	Replication float64
+	Dataless    bool
 }
 
-func GetMemTotal(host, user, password string) int {
-	var n NodeSelf
+type RebalanceStatus struct {
+	Status string
+}
 
-	err := getNodeSelf(host, user, password, &n)
-	chkerr(err)
+func NewRestClient(clusters []ServerSpec, provider Provider, cm *ContainerManager) RestClient {
+	rest := RestClient{
+		Clusters:        clusters,
+		Provider:        provider,
+		Cm:              cm,
+		TopologyChanged: true,
+		nodeCache:       cmap.New(),
+		IsWatching:      false,
+	}
 
+	return rest
+}
+
+func (r *RestClient) resetCache() {
+
+	for k := range r.nodeCache.Items() {
+		r.nodeCache.Remove(k)
+	}
+}
+
+func (r *RestClient) WatchForTopologyChanges() {
+	r.IsWatching = true
+	r.resetCache()
+
+	for {
+
+		// wait before checking rebalance status
+		time.Sleep(10 * time.Second)
+
+		// reset cache if any of the clusters are rebalancing
+		for _, cluster := range r.Clusters {
+			orchestrator := cluster.Names[0]
+			if r.ClusterIsRebalancing(orchestrator) {
+				r.resetCache()
+			}
+		}
+	}
+
+	r.IsWatching = false
+}
+
+func (r *RestClient) GetServerVersion() string {
+	host := r.GetOrchestrator()
+	n := r.GetHostNodeSelf(host)
+	return n.Version
+}
+
+func (r *RestClient) GetMemTotal(host string) int {
+	n := r.getHostNodeSelf(host)
 	q := n.MemoryTotal
 	if q == 0 {
 		time.Sleep(5 * time.Second)
-		return GetMemTotal(host, user, password)
+		return r.GetMemTotal(host)
 	}
 	q = q / 1048576 // mb
 	return q
 }
 
-func GetMemReserved(host, user, password string) int {
-	var n NodeSelf
-
-	err := getNodeSelf(host, user, password, &n)
-	chkerr(err)
-
+func (r *RestClient) GetMemReserved(host string) int {
+	n := r.getHostNodeSelf(host)
 	q := n.McdMemoryReserved
 	if q == 0 {
 		time.Sleep(5 * time.Second)
-		return GetMemReserved(host, user, password)
+		return r.GetMemReserved(host)
 	}
+
 	return q
 }
 
-func GetIndexQuota(host, user, password string) int {
-	var n NodeSelf
-
-	err := getNodeSelf(host, user, password, &n)
-	chkerr(err)
-
+func (r *RestClient) GetIndexQuota(host string) int {
+	n := r.getHostNodeSelf(host)
 	q := n.IndexMemoryQuota
 	if q == 0 {
 		time.Sleep(5 * time.Second)
-		return GetIndexQuota(host, user, password)
+		return r.GetIndexQuota(host)
 	}
+
 	return q
 }
 
-func NodeHasService(service, host, user, password string) bool {
-	var n NodeSelf
-	err := getNodeSelf(host, user, password, &n)
-	if err != nil {
-		return false
-	}
+func (r *RestClient) ClusterIsRebalancing(host string) bool {
+	url := r.Provider.GetRestUrl(host)
+	auth := r.GetAuth(host)
+	s := r.GetRebalanceStatuses(auth, url)
+	return s.Status != "none"
+}
+
+func (r *RestClient) NodeHasService(service, host string) bool {
+	n := r.GetHostNodeSelf(host)
 	for _, s := range n.Services {
 		if s == service {
 			return true
 		}
 	}
-
 	return false
 }
 
-func GetServerVersion(host, user, password string) string {
-	var n NodeSelf
-
-	err := getNodeSelf(host, user, password, &n)
-	chkerr(err)
-
-	q := n.Version
-	if q == "" {
-		time.Sleep(1 * time.Second)
-		return GetServerVersion(host, user, password)
-	}
-
-	return q
-}
-
-func NodeIsSingle(host, user, password string) bool {
-
-	var n interface{}
-	var single bool = false
-	if err := getNodeStatus(host, user, password, &n); err == nil {
-		s := n.(map[string]interface{})
-		single = len(s) == 1
-	}
+func (r *RestClient) NodeIsSingle(host string) bool {
+	n := r.GetHostNodeStatuses(host)
+	single := len(n) == 1
 	return single
 }
 
-func getNodeStatus(host, user, password string, v interface{}) error {
-	return _jsonRequest("http://%s/nodeStatuses", host, user, password, v)
+func (r *RestClient) GetOrchestrator() string {
+	cluster := r.Clusters[0]
+	return cluster.Names[0]
 }
 
-func getNodeSelf(host, user, password string, v interface{}) error {
-	return _jsonRequest("http://%s/nodes/self", host, user, password, v)
+func (r *RestClient) GetAuth(host string) string {
+	for _, cluster := range r.Clusters {
+		for _, _host := range cluster.Names {
+			if _host == host {
+				user := cluster.RestUsername
+				pass := cluster.RestPassword
+				return fmt.Sprintf("%s:%s", user, pass)
+			}
+		}
+	}
+	return ""
 }
 
-func _jsonRequest(url, host, user, password string, v interface{}) error {
+func (r *RestClient) GetHostNodeSelf(host string) NodeSelf {
 
-	// setup request url
-	urlStr := fmt.Sprintf(url, host)
-	req, err := http.NewRequest("GET", urlStr, nil)
-	chkerr(err)
-	req.SetBasicAuth(user, password)
+	if val, ok := r.cacheGet("self", host); ok {
+		return val.(NodeSelf)
+	}
+	return r.getHostNodeSelf(host)
+}
 
-	// send client request
-	client := &http.Client{}
-	res, err := client.Do(req)
-	if err != nil {
-		return err
+func (r *RestClient) getHostNodeSelf(host string) NodeSelf {
+
+	url := r.Provider.GetRestUrl(host)
+	auth := r.GetAuth(host)
+	n := r.GetNodeSelf(auth, url)
+	r.cacheSet("self", host, n)
+	return n
+}
+
+func (r *RestClient) GetHostNodeStatuses(host string) NodeStatuses {
+
+	if val, ok := r.cacheGet("status", host); ok {
+		return val.(NodeStatuses)
 	}
 
-	// unmarshal data to provided interface
-	body, err := ioutil.ReadAll(res.Body)
-	chkerr(err)
-	err = json.Unmarshal(body, v)
-	chkerr(err)
-	return nil
+	return r.getHostNodeStatuses(host)
+}
+
+func (r *RestClient) getHostNodeStatuses(host string) NodeStatuses {
+	url := r.Provider.GetRestUrl(host)
+	auth := r.GetAuth(host)
+	n := r.GetNodeStatuses(auth, url)
+	r.cacheSet("status", host, n)
+	return n
+}
+
+func (r *RestClient) GetNodeSelf(auth, url string) NodeSelf {
+	reqUrl := fmt.Sprintf("%s/nodes/self", url)
+	var n NodeSelf
+	r.JsonRequest(auth, reqUrl, &n)
+	return n
+}
+
+func (r *RestClient) GetNodeStatuses(auth, url string) NodeStatuses {
+	reqUrl := fmt.Sprintf("%s/nodeStatuses", url)
+	var n NodeStatuses
+	r.JsonRequest(auth, reqUrl, &n)
+	return n
+}
+
+func (r *RestClient) GetRebalanceStatuses(auth, url string) RebalanceStatus {
+	reqUrl := fmt.Sprintf("%s/pools/default/rebalanceProgress", url)
+	var s RebalanceStatus
+	r.JsonRequest(auth, reqUrl, &s)
+	return s
+}
+
+//
+func (r *RestClient) JsonRequest(auth, restUrl string, v interface{}) {
+	// run curl container to make rest request
+	cmd := []string{"-u", auth, "-s", restUrl}
+	id, svcId := r.Cm.RunRestContainer(cmd)
+
+	// convert logs to json
+	resp := r.Cm.GetLogs(id, "all")
+	parseErr := StringToJson(resp, &v)
+
+	// reset cache if we got a bad response
+	// as this indicates unstable cluster
+	if parseErr != nil {
+		r.resetCache()
+	}
+
+	// remove container
+	if r.Cm.ProviderType == "swarm" {
+		err := r.Cm.RemoveService(svcId)
+		logerr(err)
+	} else {
+		err := r.Cm.RemoveContainer(id)
+		logerr(err)
+	}
+}
+
+func (r *RestClient) cacheGet(ctx, key string) (interface{}, bool) {
+	cacheKey := fmt.Sprintf("%s/%s", ctx, key)
+	return r.nodeCache.Get(cacheKey)
+}
+
+func (r *RestClient) cacheSet(ctx, key string, val interface{}) {
+	cacheKey := fmt.Sprintf("%s/%s", ctx, key)
+	r.nodeCache.Set(cacheKey, val)
 }

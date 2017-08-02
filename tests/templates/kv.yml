@@ -1,52 +1,42 @@
-- 
+-
+  name: pillowfight
+  actions:
+    -
+      image: sequoiatools/pillowfight
+      command: "-U  couchbase://$0/$1{{if le 5.0 $.Version}}?select_bucket=true{{end}} $2{{if le 5.0 $.Version}} -P $3{{end}}"
+
+-
   name: pillowfight_small
   actions:
     -
-      image: sequoiatools/pillowfight
-      command: "-U  {{.Orchestrator}} -B 100 -t 1 -c 100"
+      template: pillowfight
+      args: "{{.Orchestrator}}, {{.Bucket}}, -B 100 -t 1 -c 100, {{.AuthPassword}}"
 
 -
-  name: pillowfight_hi
+  # high throughput pillowfight
+  name: pillowfight_htp
   actions:
     -
-      image: sequoiatools/pillowfight
-      command: "-U  {{.Orchestrator}} -I {{.Scale 1000}} -B {{.Scale 100}} -t 4 -c 100"
+      template: pillowfight
+      args: "{{.Orchestrator}}, {{.Bucket}},-I {{.Scale 1000}} -B {{.Scale 100}} -t 4 -c 100, {{.AuthPassword}}"
 
-
+# runs the pillowfight template followed by wait
+# $0 = node
+# $1 = bucket
+# $2 = pillowfight args
+# $3 = rbac user
+# $4 = concurrent loaders
+# $5 = wait
 -
-  name: wait_for_dgm
-  actions:
-    -
-      image: appropriate/curl
-      command: "-s -u {{.RestUsername}}:{{.RestPassword}} {{.Orchestrator}}:8091/pools/default/buckets/$0/stats"
-      repeat: -1
-      # wait until active_item ratio (as $ratio) reaches value proved by arg $1 on bucket $0
-      # this check saves current ratio into a variable as $ratio and then performs checking
-      # checking is only initiated 'if .AllLogs' is returning stats
-      until: "{{if .AllLogs `__self__`}}
-                  {{with $sample:=(.TailLogs `__self__` 1 | json)}}
-                    {{with $ratio:=ftoint (last $sample.op.samples.vb_active_resident_items_ratio)}}
-                       {{lt $ratio $1}}
-                    {{else}}{{false}}{{end}}
-                  {{else}}{{false}}{{end}}
-              {{else}}{{false}}{{end}}"
-      wait: true
-
--
-  name: wait_for_items
-  actions:
-    -
-      image: appropriate/curl
-      command: "-s -u {{.RestUsername}}:{{.RestPassword}} {{.Orchestrator}}:8091/pools/default/buckets/$0/stats"
-      repeat: -1
-      # wait until active_item ratio (as $ratio) reaches value proved by arg $1 on bucket $0
-      # this check saves current ratio into a variable as $ratio and then performs checking
-      # checking is only initiated 'if .AllLogs' is returning stats
-      until: "{{if .AllLogs `__self__`}}
-                  {{with $sample:=(.TailLogs `__self__` 1 | json)}}
-                    {{with $val:=ftoint (last $sample.op.samples.curr_items)}}
-                       {{lt $1 $val}}
-                    {{else}}{{false}}{{end}}
-                  {{else}}{{false}}{{end}}
-              {{else}}{{false}}{{end}}"
-      wait: true
+   name: pillowfight_and_wait
+   actions:
+     -
+       template: pillowfight
+       args: "$0, $1, $2, $3"
+       concurrency: "$4"
+       wait: false
+     -
+       image: sequoiatools/cmd
+       entrypoint: sleep
+       command: "$5"
+       wait: true

@@ -5,6 +5,13 @@ import (
 	"strings"
 )
 
+type RbacSpec struct {
+	Name       string
+	Password   string
+	Roles      string
+	AuthDomain string `yaml:"auth_domain"`
+}
+
 type BucketSpec struct {
 	Name      string
 	Names     []string
@@ -32,6 +39,7 @@ type ServerSpec struct {
 	SSHPassword  string `yaml:"ssh_password"`
 	RestPort     string `yaml:"rest_port"`
 	ViewPort     string `yaml:"view_port"`
+	FTSPort      string `yaml:"fts_port"`
 	QueryPort    string `yaml:"query_port"`
 	InitNodes    uint8  `yaml:"init_nodes"`
 	DataPath     string `yaml:"data_path"`
@@ -42,6 +50,26 @@ type ServerSpec struct {
 	NodesActive  uint8
 	Services     map[string]uint8
 	NodeServices map[string][]string
+	Users        string
+	RbacSpecs    []RbacSpec
+}
+
+type SyncGatewaySpec struct {
+	Name        string
+	Names       []string
+	Count       uint8
+	CountOffset uint8
+}
+
+type AccelSpec struct {
+	Name        string
+	Names       []string
+	Count       uint8
+	CountOffset uint8
+}
+
+type LoadBalancerSpec struct {
+	Name string
 }
 
 type ViewSpec struct {
@@ -57,10 +85,14 @@ type DDocSpec struct {
 }
 
 type ScopeSpec struct {
-	Buckets []BucketSpec
-	Servers []ServerSpec
-	Views   []ViewSpec
-	DDocs   []DDocSpec `yaml:"ddocs"`
+	Buckets      []BucketSpec
+	Servers      []ServerSpec
+	SyncGateways []SyncGatewaySpec
+	Accels       []AccelSpec
+	LoadBalancer LoadBalancerSpec
+	Views        []ViewSpec
+	DDocs        []DDocSpec `yaml:"ddocs"`
+	Users        []RbacSpec
 }
 
 func (s *ServerSpec) InitNodeServices() {
@@ -82,33 +114,33 @@ func (s *ServerSpec) InitNodeServices() {
 	// and second set index to avoid
 	// overlapping if possible when specific
 	// number of service types provided
-	indexStartPos := numNodes - numQueryNodes - numIndexNodes
+	indexStartPos := numNodes - numQueryNodes - numIndexNodes - numFtsNodes
 	if customIndexStart > 0 {
 		// override
 		indexStartPos = customIndexStart - 1
 	}
-	if indexStartPos > numNodes {
+	if indexStartPos >= numNodes {
 		indexStartPos = 0
 	}
 
-	// fts defaults on same box as index machine
-	// override with fts_start
-	ftsStartPos := indexStartPos
-	if customFtsStart > 0 {
-		// override
-		ftsStartPos = customFtsStart - 1
-	}
-	if ftsStartPos > numNodes {
-		ftsStartPos = 0
-	}
-
-	queryStartPos := numNodes - numQueryNodes
+	queryStartPos := numNodes - numQueryNodes - numFtsNodes
 	if customQueryStart > 0 {
 		// override
 		queryStartPos = customQueryStart - 1
 	}
-	if queryStartPos > numNodes {
+	if queryStartPos >= numNodes {
 		queryStartPos = 0
+	}
+
+	// fts defaults on last machine
+	// override with fts_start
+	ftsStartPos := numNodes - numFtsNodes
+	if customFtsStart > 0 {
+		// override
+		ftsStartPos = customFtsStart - 1
+	}
+	if ftsStartPos >= numNodes {
+		ftsStartPos = 0
 	}
 
 	for i = 0; i < numNodes; i = i + 1 {
@@ -164,6 +196,42 @@ func (s *ScopeSpec) ApplyToAllServersAsync(operation func(string, *ServerSpec, c
 	}
 }
 
+func (s *ScopeSpec) ApplyToAllSyncGatewayAsync(operation func(string, *SyncGatewaySpec, chan bool)) {
+
+	waitChans := []chan bool{}
+	for i, syncGateway := range s.SyncGateways {
+		endIdx := len(syncGateway.Names)
+		for _, syncGatewayName := range syncGateway.Names[:endIdx] {
+			c := make(chan bool)
+			// allowed apply func to modify server
+			go operation(syncGatewayName, &s.SyncGateways[i], c)
+			waitChans = append(waitChans, c)
+		}
+	}
+
+	for _, c := range waitChans {
+		<-c
+	}
+}
+
+func (s *ScopeSpec) ApplyToAllAccelsAsync(operation func(string, *AccelSpec, chan bool)) {
+
+	waitChans := []chan bool{}
+	for i, accel := range s.Accels {
+		endIdx := len(accel.Names)
+		for _, accelName := range accel.Names[:endIdx] {
+			c := make(chan bool)
+			// allowed apply func to modify server
+			go operation(accelName, &s.Accels[i], c)
+			waitChans = append(waitChans, c)
+		}
+	}
+
+	for _, c := range waitChans {
+		<-c
+	}
+}
+
 func (s *ScopeSpec) ApplyToServers(operation func(string, *ServerSpec),
 	startIdx int, endIdx int) {
 
@@ -205,6 +273,8 @@ func (s *ScopeSpec) ToAttr(attr string) string {
 		return "ViewPort"
 	case "query_port":
 		return "QueryPort"
+	case "fts_port":
+		return "FTSPort"
 	}
 
 	return ""
@@ -235,7 +305,6 @@ func NewScopeSpec(fileName string) ScopeSpec {
 
 func SpecFromYaml(fileName string) ScopeSpec {
 	var spec ScopeSpec
-
 	// init from yaml
 	ReadYamlFile(fileName, &spec)
 	ConfigureSpec(&spec)
@@ -281,6 +350,10 @@ func ConfigureSpec(spec *ScopeSpec) {
 
 	// init server section of spec
 	for i, server := range spec.Servers {
+		if server.Name == "" {
+			server.Name = RandHostStr(6)
+			spec.Servers[i].Name = server.Name
+		}
 		spec.Servers[i].Names = ExpandServerName(server.Name, server.Count, 1)
 		spec.Servers[i].BucketSpecs = make([]BucketSpec, 0)
 
@@ -291,10 +364,32 @@ func ConfigureSpec(spec *ScopeSpec) {
 				spec.Servers[i].BucketSpecs = append(spec.Servers[i].BucketSpecs, bucketSpec)
 			}
 		}
+
+		// map servers to user objects
+		userList := CommaStrToList(spec.Servers[i].Users)
+		spec.Servers[i].RbacSpecs = make([]RbacSpec, 0)
+		for _, userName := range userList {
+			for _, rbacSpec := range spec.Users {
+				if rbacSpec.Name == userName {
+					spec.Servers[i].RbacSpecs = append(spec.Servers[i].RbacSpecs, rbacSpec)
+					break
+				}
+			}
+		}
+
 		// init node services
 		spec.Servers[i].InitNodeServices()
 	}
 
+	// Add Sync Gateway names to spec
+	for i, syncGateway := range spec.SyncGateways {
+		spec.SyncGateways[i].Names = ExpandServerName(syncGateway.Name, syncGateway.Count, 1)
+	}
+
+	// Add Accel names to spec
+	for i, accel := range spec.Accels {
+		spec.Accels[i].Names = ExpandServerName(accel.Name, accel.Count, 1)
+	}
 }
 
 // some common defaults when not defined in yaml scope
@@ -323,6 +418,8 @@ func SpecFromIni(fileName string) ScopeSpec {
 	}
 	clusterName := RandStr(6)
 	serverSpec.Name = clusterName + ".st.couchbase.com"
+
+	// parse testrunner style
 	for i, serverKey := range cfg.Section("servers").Keys() {
 		serverSpec.Count = uint8(i + 1)
 		name := fmt.Sprintf("%s-%d.st.couchbase.com",
@@ -363,6 +460,25 @@ func SpecFromIni(fileName string) ScopeSpec {
 		}
 		serverSpec.Ram = "60%"
 	}
+
+	// parse for generic init
+	if sec, err := cfg.GetSection("cluster"); err == nil {
+		count := 4
+		if key, err := sec.GetKey("num_containers"); err == nil {
+			count, _ = key.Int()
+		}
+		for i := 0; i < count; i = i + 1 {
+			serverSpec.Count = uint8(i + 1)
+			name := fmt.Sprintf("%s-%d.st.couchbase.com",
+				clusterName,
+				serverSpec.Count)
+			if len(cfg.Section("servers").Keys()) == 1 {
+				name = fmt.Sprintf("%s.st.couchbase.com", clusterName)
+			}
+			serverSpec.Names = append(serverSpec.Names, name)
+		}
+	}
+
 	serverSpec.InitNodes = serverSpec.Count
 	spec.Servers = append(spec.Servers, serverSpec)
 	return spec

@@ -8,22 +8,24 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/fsouza/go-dockerclient"
-	"github.com/streamrail/concurrent-map"
-	"github.com/tahmmee/tap.go"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/docker/docker/api/types/swarm"
+	"github.com/fsouza/go-dockerclient"
+	"github.com/streamrail/concurrent-map"
+	"github.com/tahmmee/tap.go"
 )
 
 type ContainerTask struct {
 	Name        string
 	Describe    string
 	Image       string
+	Volumes     []string
 	ImageAlias  string
 	Command     []string
 	LinksTo     string
@@ -43,74 +45,58 @@ type TaskResult struct {
 	Error   error
 }
 
-func (t *ContainerTask) GetOptions() docker.CreateContainerOptions {
+func (cm *ContainerManager) NewContainerOptions(image string, cmd []string, binds []string) docker.CreateContainerOptions {
 
-	hostConfig := docker.HostConfig{}
-
-	if len(t.LinksTo) > 0 {
-		links := strings.Split(t.LinksTo, ",")
-		pairs := []string{}
-		for i, name := range links {
-			linkName := fmt.Sprintf("container-%d.st.couchbase.com", i)
-			pairs = append(pairs, name+":"+linkName)
-		}
-		hostConfig.Links = pairs
+	hostConfig := docker.HostConfig{
+		Binds: binds,
 	}
 
 	config := docker.Config{
-		Image: t.Image,
-		Cmd:   t.Command,
-	}
-	if len(t.Entrypoint) > 0 {
-		config.Entrypoint = t.Entrypoint
+		Image: image,
+		Cmd:   cmd,
 	}
 
-	containerOpts := docker.CreateContainerOptions{
+	options := docker.CreateContainerOptions{
 		Config:     &config,
 		HostConfig: &hostConfig,
 	}
+	return options
+}
 
-	if t.Name != "" {
-		containerOpts.Name = t.Name
+func (t *ContainerTask) UpdateContainerOptions(options *docker.CreateContainerOptions) {
+
+	if len(t.LinksTo) > 0 {
+		options.HostConfig.Links = GenerateLinkPairs(t.LinksTo)
 	}
 
-	return containerOpts
+	if len(t.Entrypoint) > 0 {
+		options.Config.Entrypoint = t.Entrypoint
+	}
+
+	if t.Name != "" {
+		options.Name = t.Name
+	}
 
 }
 
-func (t *ContainerTask) GetServiceOptions(svcPort uint32) docker.CreateServiceOptions {
+func (cm *ContainerManager) NewServiceOptions(image string, cmd []string) docker.CreateServiceOptions {
 
-	var serviceName string
-	if t.Name != "" {
-		serviceName = strings.Replace(t.Name, ".", "-", -1)
-	} else {
-		serviceName = RandStr(8)
-	}
+	// makes generic service options
+	serviceName := RandStr(8)
 	containerSpec := swarm.ContainerSpec{
-		Image: t.Image,
-		Args:  t.Command,
-	}
-	// note the inconsistencies between entrypoint and command
-	// https://github.com/docker/docker/issues/24196
-	if len(t.Entrypoint) > 0 {
-		containerSpec.Command = t.Entrypoint
+		Image: image,
+		Args:  cmd,
 	}
 
-	// create task spec
 	annotations := swarm.Annotations{Name: serviceName}
 	policy := swarm.RestartPolicy{Condition: swarm.RestartPolicyConditionNone}
 	placement := swarm.Placement{Constraints: []string{"node.labels.zone == client"}}
-	taskSpec := swarm.TaskSpec{ContainerSpec: containerSpec,
+	taskSpec := swarm.TaskSpec{ContainerSpec: &containerSpec,
 		RestartPolicy: &policy,
 		Placement:     &placement}
 
 	// service spec requires port config to be placed on swarm nework
-	portConfig := []swarm.PortConfig{
-		swarm.PortConfig{
-			TargetPort:    svcPort,
-			PublishedPort: svcPort,
-		},
-	}
+	portConfig := []swarm.PortConfig{swarm.PortConfig{}}
 	endpointSpec := swarm.EndpointSpec{Ports: portConfig}
 
 	// create service spec
@@ -121,30 +107,52 @@ func (t *ContainerTask) GetServiceOptions(svcPort uint32) docker.CreateServiceOp
 	}
 
 	// create options
-	options := docker.CreateServiceOptions{
+	opts := docker.CreateServiceOptions{
 		ServiceSpec: spec,
 	}
 
-	return options
+	return opts
+}
+
+func (t *ContainerTask) UpdateServiceOptions(options *docker.CreateServiceOptions) {
+
+	// override the generic service options
+	if t.Name != "" {
+		taskName := strings.Replace(t.Name, ".", "-", -1)
+		options.ServiceSpec.Annotations.Name = taskName
+	}
+
+	if len(t.LinksTo) > 0 {
+		envStr := fmt.Sprintf("SWARM_HOSTS=%s", t.LinksTo)
+		options.TaskTemplate.ContainerSpec.Env = []string{envStr}
+	}
+
+	// note the inconsistencies between entrypoint and command
+	// https://github.com/docker/docker/issues/24196
+	if len(t.Entrypoint) > 0 {
+		options.TaskTemplate.ContainerSpec.Command = t.Entrypoint
+	}
+
 }
 
 type ContainerManager struct {
 	Client               *docker.Client
 	Endpoint             string
+	Network              string
 	TagId                map[string]string
 	IDs                  []string
 	Services             []string
 	TapHandle            *tap.T
 	ProviderType         string
-	LastSvcPort          uint32
 	SwarmClients         []*docker.Client
 	ContainerClientCache cmap.ConcurrentMap
+	imageStatus          map[string]string
 }
 
 func NewDockerClient(clientUrl string) *docker.Client {
-
 	var client *docker.Client
 	var err error
+
 	// open docker client
 	if strings.Index(clientUrl, "https") > -1 {
 		// with tls
@@ -162,27 +170,47 @@ func NewDockerClient(clientUrl string) *docker.Client {
 	return client
 }
 
-func NewContainerManager(clientUrl, provider string) *ContainerManager {
+func NewContainerManager(clientUrl, provider string, network string) *ContainerManager {
 
 	var client *docker.Client = NewDockerClient(clientUrl)
 
 	cm := ContainerManager{
 		Client:               client,
 		Endpoint:             clientUrl,
+		Network:              network,
 		TagId:                make(map[string]string),
 		IDs:                  []string{},
 		Services:             []string{},
 		TapHandle:            tap.New("results.tap4j"),
 		ProviderType:         provider,
-		LastSvcPort:          100,
 		SwarmClients:         []*docker.Client{},
 		ContainerClientCache: cmap.New(),
+		imageStatus:          make(map[string]string),
 	}
 
-	if provider == "swarm" {
+	// get all swarm nodes
+	opts := docker.ListNodesOptions{}
+	nodes, _ := client.ListNodes(opts)
+
+	if len(nodes) > 0 { // this is a swarm
 		cm.SwarmClients = cm.CreateSwarmClients(clientUrl)
+		cm.ProviderType = "swarm"
 	}
 	return &cm
+}
+
+// CreateNetwork will create a docker network that containers
+// can be attached to. Each container on a network will be able to
+// see other containers on that network. It can be used as an alternative
+// to Links.
+func (cm *ContainerManager) CreateNetwork(name string) {
+	colorsay(fmt.Sprintf("Creating network: %s", name))
+	networkOpts := docker.CreateNetworkOptions{
+		Name:           name,
+		CheckDuplicate: true,
+	}
+	_, err := cm.Client.CreateNetwork(networkOpts)
+	chkerr(err)
 }
 
 func (cm *ContainerManager) CreateSwarmClients(clientUrl string) []*docker.Client {
@@ -244,6 +272,10 @@ func (cm *ContainerManager) AllClients() []*docker.Client {
 	return clients
 }
 
+func (cm *ContainerManager) NumClients() int {
+	return len(cm.AllClients())
+}
+
 func (cm *ContainerManager) GetAllContainers() []docker.APIContainers {
 
 	allContainers := []docker.APIContainers{}
@@ -270,7 +302,7 @@ func (cm *ContainerManager) GetAllServices() []swarm.Service {
 	return services
 }
 
-func (cm *ContainerManager) ExecContainer(id string) error {
+func (cm *ContainerManager) ExecContainer(id string, cmd []string, detach bool) error {
 	client := cm.ClientForContainer(id)
 
 	// create the exec session
@@ -280,7 +312,7 @@ func (cm *ContainerManager) ExecContainer(id string) error {
 		AttachStdout: true,
 		AttachStderr: true,
 		Tty:          true,
-		Cmd:          []string{"bash"}, //TODO: we may not always want that
+		Cmd:          cmd,
 	}
 	exec, err := client.CreateExec(createOpts)
 	chkerr(err)
@@ -292,7 +324,7 @@ func (cm *ContainerManager) ExecContainer(id string) error {
 		ErrorStream:  os.Stderr,
 		Tty:          true,
 		RawTerminal:  true,
-		Detach:       false,
+		Detach:       detach,
 	}
 	return client.StartExec(exec.ID, startOpts)
 }
@@ -453,6 +485,11 @@ func (cm *ContainerManager) CheckImageExists(image string) bool {
 	return found
 }
 
+func (cm *ContainerManager) DidPull(repo string) bool {
+	_, exists := cm.imageStatus[repo]
+	return exists
+}
+
 func (cm *ContainerManager) PullImage(repo string) error {
 	msg := UtilTaskMsg("[pull]", repo)
 	cm.TapHandle.Ok(true, msg)
@@ -483,6 +520,8 @@ func (cm *ContainerManager) pullImage(client *docker.Client, repo string, ch cha
 	}
 	err := client.PullImage(imgOpts, docker.AuthConfiguration{})
 	ch <- err
+
+	cm.imageStatus[repo] = "y"
 }
 
 func (cm *ContainerManager) PullTaggedImage(repo, tag string) {
@@ -568,7 +607,8 @@ func (cm *ContainerManager) GetLogs(ID, tail string) string {
 		Stdout:       true,
 		Tail:         tail,
 	}
-	cm.Client.Logs(logOpts)
+	client := cm.ClientForContainer(ID)
+	client.Logs(logOpts)
 	return buf.String()
 }
 
@@ -643,6 +683,11 @@ func (cm *ContainerManager) StartContainer(id string, hostConfig *docker.HostCon
 
 func (cm *ContainerManager) RunContainer(opts docker.CreateContainerOptions) (chan TaskResult, *docker.Container) {
 
+	// If we have defined a network, use that network in host config
+	if cm.Network != "" {
+		opts.HostConfig.NetworkMode = cm.Network
+	}
+
 	container, err := cm.Client.CreateContainer(opts)
 	logerr(err)
 
@@ -650,6 +695,7 @@ func (cm *ContainerManager) RunContainer(opts docker.CreateContainerOptions) (ch
 
 	// start container
 	err = cm.StartContainer(container.ID, nil)
+
 	logerr(err)
 
 	go cm.WaitContainer(container, c)
@@ -715,7 +761,7 @@ func (cm *ContainerManager) ContainerForService(service *swarm.Service) (*docker
 	return nil, nil
 }
 
-func (cm *ContainerManager) RunContainerAsService(opts docker.CreateServiceOptions, wait int) (chan TaskResult, *docker.Container) {
+func (cm *ContainerManager) RunContainerAsService(opts docker.CreateServiceOptions, wait int) (chan TaskResult, *docker.Container, string) {
 
 	var container *docker.Container
 	service := cm.RunService(opts)
@@ -744,17 +790,8 @@ func (cm *ContainerManager) RunContainerAsService(opts docker.CreateServiceOptio
 	// save ID
 	cm.IDs = append(cm.IDs, container.ID)
 
-	return c, container
+	return c, container, service.ID
 
-}
-
-func (cm *ContainerManager) GetHighSvcPort() uint32 {
-	if cm.LastSvcPort == 8091 {
-		cm.LastSvcPort = 100
-	}
-	// todo free pool
-	cm.LastSvcPort += 1
-	return cm.LastSvcPort
 }
 
 func (cm *ContainerManager) RunContainerTask(task *ContainerTask) (chan TaskResult, *docker.Container) {
@@ -764,11 +801,13 @@ func (cm *ContainerManager) RunContainerTask(task *ContainerTask) (chan TaskResu
 	var ch chan TaskResult
 	if cm.ProviderType == "swarm" {
 		// run container within service
-		options := task.GetServiceOptions(cm.GetHighSvcPort())
-		ch, container = cm.RunContainerAsService(options, 30)
+		options := cm.NewServiceOptions(task.Image, task.Command)
+		task.UpdateServiceOptions(&options)
+		ch, container, _ = cm.RunContainerAsService(options, 30)
 	} else {
 		// run container against standalone docker host
-		options := task.GetOptions()
+		options := cm.NewContainerOptions(task.Image, task.Command, task.Volumes)
+		task.UpdateContainerOptions(&options)
 		ch, container = cm.RunContainer(options)
 	}
 
@@ -862,4 +901,44 @@ func (cm *ContainerManager) HandleResults(idChans *[]chan TaskResult, echan chan
 		}()
 		close(ch)
 	}
+}
+
+func (cm *ContainerManager) RunRestContainer(cmd []string) (string, string) {
+	var rest_container_id string
+	rest_container_svc_id := ""
+	image := "appropriate/curl"
+
+	if cm.ProviderType == "swarm" {
+
+		// as swarm
+		opts := cm.NewServiceOptions(image, cmd)
+		ch, _, svcId := cm.RunContainerAsService(opts, 30)
+		rc := <-ch
+		logerr(rc.Error)
+		rest_container_id = rc.ID
+		rest_container_svc_id = svcId
+
+	} else {
+
+		// normal docker, no volume mounts
+		volumes := []string{}
+		options := cm.NewContainerOptions(image, cmd, volumes)
+		_, container := cm.RunContainer(options)
+		_, err := cm.Client.WaitContainer(container.ID)
+		logerr(err)
+		rest_container_id = container.ID
+
+	}
+
+	return rest_container_id, rest_container_svc_id
+}
+
+func GenerateLinkPairs(linksTo string) []string {
+	links := strings.Split(linksTo, ",")
+	pairs := []string{}
+	for i, name := range links {
+		linkName := fmt.Sprintf("container-%d.st.couchbase.com", i)
+		pairs = append(pairs, name+":"+linkName)
+	}
+	return pairs
 }

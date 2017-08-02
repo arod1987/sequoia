@@ -1,0 +1,6 @@
+results.tap4j
+sequoia
+debug
+logs/
+hosts.json
+containers/syncgateway/nginx.conf.j2

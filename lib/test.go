@@ -3,6 +3,7 @@ package sequoia
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -22,26 +23,33 @@ type CollectionManager struct {
 }
 
 type ActionSpec struct {
-	Describe    string
-	Image       string
-	Command     string
-	Wait        bool
-	CondWait    string
-	Before      string
-	Entrypoint  string
-	Requires    string
-	Concurrency string
-	Duration    string
-	Alias       string
-	Repeat      int
-	Until       string
-	Include     string
-	Template    string
-	Args        string
-	Test        string
-	Scope       string
-	ForEach     string
-	Client      ClientActionSpec
+	Describe     string
+	Image        string
+	Command      string
+	Volumes      string
+	CommandRaw   string
+	Wait         bool
+	CondWait     string
+	Before       string
+	Entrypoint   string
+	Requires     string
+	Concurrency  string
+	Duration     string
+	Alias        string
+	Repeat       int
+	Until        string
+	Include      string
+	Template     string
+	Args         string
+	Test         string
+	Scope        string
+	ForEach      string
+	Section      string
+	SectionStart string `yaml:"section_start"`
+	SectionEnd   string `yaml:"section_end"`
+	SectionTag   string `yaml:"section_tag"`
+	SectionSkip  string `yaml:"section_skip"`
+	Client       ClientActionSpec
 }
 
 // returns yaml formattable string
@@ -50,6 +58,7 @@ func (a *ActionSpec) String() string {
 		`-
  image: %q
  command: %q
+ commandraw: %s
  wait: %t
  condwait: %q
  before: %q
@@ -62,7 +71,8 @@ func (a *ActionSpec) String() string {
  template: %q
  args: %q
  client: %v
-`, a.Image, a.Command, a.Wait, a.CondWait, a.Before, a.Entrypoint, a.Requires,
+`, a.Image, a.Command, a.CommandRaw, a.Wait, a.CondWait, a.Before,
+		a.Entrypoint, a.Requires,
 		a.Concurrency, a.Duration, a.Alias, a.Repeat,
 		a.Template, a.Args, a.Client)
 }
@@ -120,21 +130,21 @@ func NewTest(flags TestFlags, cm *ContainerManager) Test {
 	switch flags.Mode {
 	case "image":
 		actions = ActionsFromArgs(*flags.ImageName, *flags.ImageCommand, *flags.ImageWait)
-	case "testrunner":
+	case "testrunner", "sdk":
 		actions = ActionsFromArgs(*flags.ImageName, *flags.ImageCommand, *flags.ImageWait)
 		if *flags.Exec == true {
 			// create new exec action
 			clientAction := ClientActionSpec{
 				Op:        "exec",
-				Container: "testrunner_id",
+				Container: "framework_id",
 			}
 			execAction := ActionSpec{
 				Client: clientAction,
 			}
 
-			// don't wait for testrunner to run
+			// don't wait for framework to run
 			actions[0].Wait = false
-			actions[0].Alias = "testrunner_id"
+			actions[0].Alias = "framework_id"
 			actions[0].Command = "wait"
 
 			// add exec action to test
@@ -158,20 +168,43 @@ func (t *Test) Run(scope Scope) {
 	if *t.Flags.SkipSetup == false {
 		// if in default mode purge all containers
 		if (t.Flags.Mode == "") && (*t.Flags.SoftCleanup == false) {
-			if scope.Provider.GetType() == "swarm" {
+			if (scope.Provider.GetType() == "swarm") || (t.Cm.ProviderType == "swarm") {
 				t.Cm.RemoveAllServices()
 			} else {
 				t.Cm.RemoveAllContainers()
 			}
 		}
-		scope.Provider.ProvideCouchbaseServers(scope.Spec.Servers)
+
+		scope.Provider.ProvideCouchbaseServers(t.Flags.ProviderConfig, scope.Spec.Servers)
+
 		if t.Flags.Mode == "" {
-			scope.Setup()
+			scope.SetupServer()
+		} else { // just wait for resources
+			if t.Flags.Exec == nil || *t.Flags.Exec == false {
+				scope.WaitForServers()
+			}
 		}
+
+		// Setup Sync Gateways
+		scope.Provider.ProvideSyncGateways(scope.Spec.SyncGateways)
+
+		// Setup Accels
+		scope.Provider.ProvideAccels(scope.Spec.Accels)
+
+		// Wait for Sync Gateways / Accels to be available
+		scope.WaitForMobile()
+
+		// If load balancer is defined in scope
+		// Add Sync Gateway to the load balancer
+		scope.Provider.ProvideLoadBalancer(scope.Spec.LoadBalancer)
+
+		scope.WriteHostConfig()
+
 	} else if (scope.Provider.GetType() != "docker") &&
 		(scope.Provider.GetType() != "swarm") {
-		// non-dynamic IP's need to be extrapolated before test
-		scope.Provider.ProvideCouchbaseServers(scope.Spec.Servers)
+		//non-dynamic IP's need to be extrapolated before test
+		scope.Provider.ProvideCouchbaseServers(t.Flags.ProviderConfig, scope.Spec.Servers)
+		scope.Provider.ProvideSyncGateways(scope.Spec.SyncGateways)
 		scope.InitCli()
 	} else {
 		// not doing setup but need to get cb versions
@@ -180,6 +213,11 @@ func (t *Test) Run(scope Scope) {
 
 	if *t.Flags.SkipTest == true {
 		return
+	}
+
+	// start topology watcher
+	if t.Flags.Mode == "" {
+		scope.StartTopologyWatcher()
 	}
 
 	// run at least <repeat> times or forever if -1
@@ -204,7 +242,7 @@ func (t *Test) Run(scope Scope) {
 	if repeat == -1 {
 		// run forever
 		for {
-			t.runActions(scope, loops, t.Actions)
+			t.runRepeatableActions(scope, loops, t.Actions)
 			// kill test containers
 			t.DoContainerCleanup(scope)
 
@@ -213,9 +251,11 @@ func (t *Test) Run(scope Scope) {
 	} else {
 		repeat++
 		for loops = 0; loops < repeat; loops++ {
-			t.runActions(scope, loops, t.Actions)
+			t.runRepeatableActions(scope, loops, t.Actions)
 			// kill test containers
-			t.DoContainerCleanup(scope)
+			if *t.Flags.SkipCleanup == false {
+				t.DoContainerCleanup(scope)
+			}
 		}
 	}
 	t.Cm.TapHandle.AutoPlan()
@@ -242,6 +282,15 @@ func (t *Test) WaitForCollect() {
 	}
 }
 
+func (t *Test) runRepeatableActions(scope Scope, loop int, actions []ActionSpec) {
+	// run actions
+	t.runActions(scope, loop, actions)
+
+	// restore the original test actions because runActions has the side-effect
+	// of modifying the Actions member for running nested templates, tests, and sections
+	t.Actions = actions
+}
+
 func (t *Test) runActions(scope Scope, loop int, actions []ActionSpec) {
 
 	var lastAction ActionSpec
@@ -257,7 +306,6 @@ func (t *Test) runActions(scope Scope, loop int, actions []ActionSpec) {
 			t.runActions(scope, loop, rangeActions)
 			continue
 		}
-
 		if action.Client.Op != "" {
 			key := action.Client.Container
 
@@ -296,17 +344,27 @@ func (t *Test) runActions(scope Scope, loop int, actions []ActionSpec) {
 			case "exec":
 				// enter into container
 				if id, ok := scope.GetVarsKV(key); ok {
-					if err := t.Cm.ExecContainer(id); err != nil {
+					colorsay("docker exec -it " + id + " bash")
+					subProcess := exec.Command("docker", "-H", *t.Flags.Client, "exec", "-it", id, "bash")
+					stdin, err := subProcess.StdinPipe()
+					logerr(err)
+					defer stdin.Close() // the doc says subProcess.Wait will close it, but I'm not sure, so I kept this line
+
+					subProcess.Stdin = os.Stdin
+					subProcess.Stdout = os.Stdout
+					subProcess.Stderr = os.Stderr
+
+					if err := subProcess.Start(); err != nil {
 						emsg := fmt.Sprintf("%s [%s] %s",
 							"failed to exec into container ",
 							id,
 							err)
 						ecolorsay(emsg)
 					} else {
-						// we are inside container, make sure it stays that way
-						*t.Flags.SkipCleanup = true
-
-						// running exec ends test
+						// wait for process to quit and cleanup
+						subProcess.Wait()
+						*t.Flags.SoftCleanup = false // purge debug containers
+						t.Cleanup(scope)
 						return
 					}
 				} else {
@@ -316,7 +374,11 @@ func (t *Test) runActions(scope Scope, loop int, actions []ActionSpec) {
 			}
 			continue
 		}
-
+		if action.SectionStart != "" ||
+			action.SectionEnd != "" ||
+			action.SectionTag != "" {
+			continue
+		}
 		if action.Scope != "" {
 			// transform cluster scope
 			newSpec := NewScopeSpec(action.Scope)
@@ -340,23 +402,66 @@ func (t *Test) runActions(scope Scope, loop int, actions []ActionSpec) {
 				}
 			}
 			scope.Spec = newSpec
-			scope.Provider.ProvideCouchbaseServers(scope.Spec.Servers)
-			scope.Setup()
+			scope.Provider.ProvideCouchbaseServers(t.Flags.ProviderConfig, scope.Spec.Servers)
+			scope.SetupServer()
 		}
 		if action.Test != "" {
 			// referencing external test
 			testActions := ActionsFromFile(action.Test)
-			t.Actions = testActions
+
+			// filter by section if provided
+			var sectionName string
+			if action.SectionSkip != "" {
+				sectionName = action.SectionSkip
+			} else {
+				sectionName = action.Section
+			}
+
+			excludedActions := []ActionSpec{}
+			if sectionName != "" {
+				t.Actions = []ActionSpec{}
+				isWithinSection := false
+				for _, action := range testActions {
+					if action.SectionStart == sectionName {
+						isWithinSection = true
+					}
+					if action.SectionEnd == sectionName {
+						isWithinSection = false
+					}
+
+					// add action if it's within a section or matches tag
+					if isWithinSection || (action.SectionTag == sectionName) {
+						t.Actions = append(t.Actions, action)
+					} else if action.Include != "" {
+						// add any includes needed for test actions
+						t.Actions = append(t.Actions, action)
+					} else {
+						excludedActions = append(excludedActions, action)
+					}
+				}
+			} else {
+				t.Actions = testActions
+			}
+
+			if action.SectionSkip != "" {
+				// skipped actions
+				t.Actions = excludedActions
+			}
 
 			// save test options
 			setup := t.Flags.SkipSetup
 			teardown := t.Flags.SkipTeardown
 			cleanup := t.Flags.SkipCleanup
+			duration := t.Flags.Duration
+			repeat := t.Flags.Repeat
 
 			ok := true
+			zero := 0
 			t.Flags.SkipSetup = &ok
 			t.Flags.SkipTeardown = &ok
 			t.Flags.SkipCleanup = &ok
+			t.Flags.Duration = &zero
+			t.Flags.Repeat = &action.Repeat
 
 			// run test
 			t.Run(scope)
@@ -365,6 +470,8 @@ func (t *Test) runActions(scope Scope, loop int, actions []ActionSpec) {
 			t.Flags.SkipSetup = setup
 			t.Flags.SkipTeardown = teardown
 			t.Flags.SkipCleanup = cleanup
+			t.Flags.Duration = duration
+			t.Flags.Repeat = repeat
 			continue
 		}
 
@@ -380,7 +487,16 @@ func (t *Test) runActions(scope Scope, loop int, actions []ActionSpec) {
 			continue
 		}
 
-		if action.Template != "" {
+		// check if action provides args to a template
+		if action.Template != "" || action.Args != "" {
+			if action.Template == "" {
+				// use last template
+				if lastAction.Template != "" {
+					action.Template = lastAction.Template
+				} else {
+					ecolorsay("ERROR: cannot provide args without template: " + action.Args)
+				}
+			}
 			// run template actions
 			if templateActions, ok := t.Templates[action.Template]; ok {
 				templateActions = t.ResolveTemplateActions(scope, action)
@@ -388,12 +504,21 @@ func (t *Test) runActions(scope Scope, loop int, actions []ActionSpec) {
 			} else {
 				ecolorsay("WARNING template not found: " + action.Template)
 			}
+
+			lastAction = action
 			continue
 		}
 
 		if action.Image == "" {
-			// reuse last action image
-			action.Image = lastAction.Image
+			if lastAction.Image != "" {
+				// reuse last action image
+				action.Image = lastAction.Image
+			}
+
+			if action.Template == "" && lastAction.Template != "" {
+				// reuse last action template
+				action.Template = lastAction.Template
+			}
 
 			// reuse last action requires
 			if action.Requires == "" {
@@ -453,10 +578,20 @@ func (t *Test) runActions(scope Scope, loop int, actions []ActionSpec) {
 			action.Describe = fmt.Sprintf("start %s: %s", action.Image, strings.Join(command, " "))
 		}
 
+		// If volumes are supplies, the container will mount them
+		// when launching. The format of the volume string should be:
+		// "<path-to-container>/folder1:/<path-in-container>/folder1,<path-to-container>/file1:/<path-in-container>/file2"
+		// folder1 and file1 must be in the samd
+		volumes := []string{}
+		if action.Volumes != "" {
+			volumes = BuildVolumes(action.Volumes)
+		}
+
 		// compile task
 		task := ContainerTask{
 			Name:        *t.Flags.ContainerName,
 			Describe:    action.Describe,
+			Volumes:     volumes,
 			Image:       action.Image,
 			Command:     command,
 			Async:       !action.Wait,
@@ -469,20 +604,37 @@ func (t *Test) runActions(scope Scope, loop int, actions []ActionSpec) {
 
 		if scope.Provider.GetType() == "docker" {
 			task.LinksTo = scope.Provider.(*DockerProvider).GetLinkPairs()
+		} else if scope.Provider.GetType() == "swarm" {
+			task.LinksTo = scope.Provider.(*SwarmProvider).GetLinkPairs()
 		}
 		if action.Entrypoint != "" {
 			task.Entrypoint = []string{action.Entrypoint}
 		}
 
-		// run task
-		if task.Async == true {
-			go t.runTask(&scope, &task, &action)
-		} else {
-			t.runTask(&scope, &task, &action)
+		// pull latest version of container if we haven't already
+		if *t.Flags.SkipPull == false &&
+			task.Image != "" &&
+			!t.Cm.DidPull(task.Image) {
+			t.Cm.PullImage(task.Image)
 		}
 
+		if *t.Flags.DryRun == false {
+			// run task
+
+			if task.Async == true {
+				go t.runTask(&scope, &task, &action)
+			} else {
+				t.runTask(&scope, &task, &action)
+			}
+
+			time.Sleep(5 * time.Second)
+		} else if len(task.Command) > 1 {
+			// just print command output without actually running
+			fmt.Println(task.Image,
+				fmt.Sprintf("[wait:%t]", action.Wait),
+				strings.Join(task.Command, " "))
+		}
 		lastAction = action
-		time.Sleep(5 * time.Second)
 	}
 
 }
@@ -573,13 +725,36 @@ func (t *Test) ResolveTemplateActions(scope Scope, action ActionSpec) []ActionSp
 		argOffset := 0
 		for i, arg := range allArgs {
 			arg = strings.TrimSpace(arg)
-			if strings.Index(arg, "(") != -1 {
-				// this is a multi arg string
-				// concatentate until we reach ")"
-				multiArg = true
-				lastArg = strings.Replace(arg, "(", "", 1)
-				argOffset++
-				continue
+			leftParenPos := strings.Index(arg, "(")
+			parenIsEscaped := false
+			if leftParenPos != -1 {
+
+				if leftParenPos > 0 {
+					leadingParenChar := string(arg[leftParenPos-1])
+					if leadingParenChar == "\\" {
+
+						// remove the escape from the action
+						arg = strings.Replace(arg, "\\", "", 1)
+
+						// skip
+						parenIsEscaped = true
+					}
+				}
+
+				if parenIsEscaped == false {
+					// this is a multi arg string
+					lastArg = strings.Replace(arg, "(", "", 1)
+
+					if strings.Index(arg, ")") != -1 {
+						// but only has single item
+						arg = strings.Replace(lastArg, ")", "", 1)
+					} else {
+						// concatentate until we reach ")"
+						multiArg = true
+						argOffset++
+						continue
+					}
+				}
 			}
 			if multiArg == true {
 				arg = fmt.Sprintf("%s,%s", lastArg, arg)
@@ -614,6 +789,11 @@ func (t *Test) ResolveTemplateActions(scope Scope, action ActionSpec) []ActionSp
 			resolvedSubAction.ForEach = subAction.ForEach
 			t.RestoreConditionalValues(subAction, &resolvedSubAction)
 			subAction = resolvedSubAction
+		}
+
+		// replace cmd with raw string if specified
+		if subAction.CommandRaw != "" {
+			subAction.Command = subAction.CommandRaw
 		}
 
 		// allow inheritance

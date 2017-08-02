@@ -3,19 +3,22 @@ package sequoia
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/fatih/color"
-	"github.com/go-ini/ini"
-	"gopkg.in/yaml.v2"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/fatih/color"
+	"github.com/go-ini/ini"
+	"gopkg.in/yaml.v2"
 )
 
 func chkerr(err error) {
@@ -91,7 +94,11 @@ func ReadYamlFile(filename string, spec interface{}) {
 
 func ReadIniFile(filename string) *ini.File {
 
-	file, err := ini.Load(filename)
+	opts := ini.LoadOptions{
+		AllowShadows:     true,
+		AllowBooleanKeys: true,
+	}
+	file, err := ini.LoadSources(opts, filename)
 	logerr(err)
 
 	return file
@@ -112,6 +119,10 @@ func ParseSlashString(s string) string {
 		return _s[1]
 	}
 	return _s[0]
+}
+
+func RandHostStr(size int) string {
+	return fmt.Sprintf("%s.%s", RandStr(size), "st.couchbase.com")
 }
 
 func RandStr(size int) string {
@@ -218,4 +229,39 @@ func CopyFileContents(src, dst string) (err error) {
 	}
 	err = out.Sync()
 	return
+}
+
+func StringToJson(data string, v interface{}) error {
+	blob := []byte(data)
+	err := json.Unmarshal(blob, &v)
+	if err != nil {
+		fmt.Println("warning using 'json' filter: ", err, blob)
+	}
+	return err
+}
+
+func BuildVolumes(volumes string) []string {
+	// If volumes are supplies, the container will mount them
+	// when launching. The formate of the volume string should be:
+	// "<path-to-container>/folder1:/<path-in-container>/folder1,<path-to-container>/file1:/<path-in-container>/file2"
+	// folder1 and file1 must be in the samd
+	volumeParts := strings.Split(volumes, ",")
+
+	// Build an absolute path to the mount location assuming we are executing
+	// seqouia from the root of the repository
+	exPath, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	chkerr(err)
+
+	// Prepend the cwd to the volume mount host path
+	// if there is not an absolute path defined
+	for i, volume := range volumeParts {
+		v := strings.TrimSpace(volume)
+		if !strings.HasPrefix(v, "/") {
+			v = exPath + "/" + v
+		}
+		colorsay("Mounting :" + v)
+		volumeParts[i] = v
+	}
+
+	return volumeParts
 }

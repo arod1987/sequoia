@@ -17,6 +17,8 @@
       template: wait_for_rebalance
       args: "$0"
 
+    - template: wait_after_rebalance
+
 # rebalance out a single node
 # $0 = server to remove
 -
@@ -33,18 +35,17 @@
       requires: "{{ eq `windows` .Platform}}"
       template: wait_for_rebalance
 
+    - template: wait_after_rebalance
+
 # rebalance in a single node
 # $0 = server to add
+# $1 = optional services (default data)
 -
   name: rebalance_in
   actions:
     -
-      image: sequoiatools/couchbase-cli
-      command: "server-add -c  {{.Orchestrator}}:{{.RestPort}}
-           --server-add $0:{{.RestPort}}
-           -u  {{.RestUsername}} -p  {{.RestPassword}}
-           --server-add-username {{.RestUsername}} --server-add-password  {{.RestPassword}}"
-      wait: true
+      template: add_node
+      args: "$0, ($1)"
     -
       template: rebalance
 
@@ -62,31 +63,33 @@
            --server-add $0:{{.RestPort}}
            -u {{.RestUsername}} -p {{.RestPassword}}
            --server-add-username {{.RestUsername}} --server-add-password {{.RestPassword}}
-           {{if ge .Version 4.0}}--services $1{{end}}"
+           {{if ge .Version 4.0}}--services {{if gt (len `$1`) 2}}$1{{else}}data{{end}}{{end}}"
       wait: true
+
+# readd a failover node to server
+# $0 node to add back
+# $1 optional orchestrator
+-
+  name: readd_node
+  command: "server-readd
+            -c {{if gt (len `$1`) 2}}$1{{else}}{{.Orchestrator}}{{end}}:{{.RestPort}}
+            --server-add $0
+            -u  {{.RestUsername}} -p  {{.RestPassword}}"
+  wait: true
 
 # swap rebalance 1x1 node
 # $0 server to add
 # $1 server to remove
+# $2 optional services (default data)
 -
   name: rebalance_swap
   actions:
     -
-      image: sequoiatools/couchbase-cli
-      command: "server-add -c  {{.Orchestrator}}:{{.RestPort}}
-           --server-add $0:{{.RestPort}}
-           -u  {{.RestUsername}} -p  {{.RestPassword}}
-           --server-add-username {{.RestUsername}} --server-add-password  {{.RestPassword}}"
-      wait: true
+      template: add_node
+      args: "$0, ($2)"
     -
-      image: sequoiatools/couchbase-cli
-      command:  "rebalance -c  {{.Orchestrator}}:{{.RestPort}}
-        --server-remove $1:{{.RestPort}}
-        -u  {{.RestUsername}} -p  {{.RestPassword}}"
-    -
-      # windows requires special status watching
-      requires: "{{ eq `windows` .Platform}}"
-      template: wait_for_rebalance
+      template: rebalance_out
+      args: "$1"
 
 # waits for any current rebalance to finish
 # receives optional orchestrator arg from callee
@@ -107,6 +110,14 @@
               {{else}}
                 {{false}}
               {{end}}"
+
+# helper method to provide additional wait after rebalancing
+- name: wait_after_rebalance
+  actions:
+    - image: sequoiatools/cmd
+      entrypoint: sleep
+      command: 60
+      wait: true
 
 # waits for current rebalance to finish on the cluster by IP
 -
@@ -198,4 +209,86 @@
       requires: "{{ eq `windows` .Platform}}"
       template: wait_for_rebalance
 
+-
+# Enable autofailover on cluster
+# $0 = Timeout for autofailover
+  name: enable_autofailover
+  actions:
+    -
+      image: sequoiatools/couchbase-cli
+      command: "setting-autofailover -c  {{.Orchestrator}}:{{.RestPort}}
+                -u  {{.RestUsername}} -p  {{.RestPassword}}
+                --enable-auto-failover=1 --auto-failover-timeout=$0"
+      wait: true
 
+-
+# Disable autofailover setting for cluster
+  name: disable_autofailover
+  actions:
+    -
+      image: sequoiatools/couchbase-cli
+      command: "setting-autofailover -c  {{.Orchestrator}}:{{.RestPort}}
+                -u  {{.RestUsername}} -p  {{.RestPassword}}
+                --enable-auto-failover=0"
+      wait: true
+
+-
+# Fail a node by killing the memcached
+# $0 = Server to fail
+  name: memcached_kill
+  actions:
+    -
+      image: "vijayviji/sshpass"
+      command: "sshpass -p {{.SSHPassword}} ssh -o StrictHostKeyChecking=no
+                  {{.SSHUsername}}@$0 kill -SIGSTOP $(pgrep memcached)"
+
+-
+# Restart memcached process on server
+# $0 = Server where memcached has to be started
+  name: start_memcached
+  actions:
+    -
+      image: "vijayviji/sshpass"
+      command: "sshpass -p {{.SSHPassword}} ssh -o StrictHostKeyChecking=no
+                  {{.SSHUsername}}@$0 kill -SIGCONT $(pgrep memcached)"
+
+-
+# Enable autofailover and fail a node. Recover the node and disable
+# autofailover
+# $0 = node to fail
+# $1 = Autofailover timeout
+# $2 = Recovery type
+  name: autofailover
+  actions:
+    -
+      template: enable_autofailover
+      args: "$1"
+      wait: true
+    -
+      template: memcached_kill
+      args: "$0"
+      wait: true
+    -
+      image: sequoiatools/cmd
+      entrypoint: sleep
+      wait: true
+      duration: 60
+    -
+      template: start_memcached
+      args: "$0"
+      wait: true
+    -
+      image: sequoiatools/cmd
+      entrypoint: sleep
+      wait: true
+      duration: 30
+    -
+      template: recover_node
+      args: "$0, $2"
+      wait: true
+    -
+      template: rebalance
+      wait: true
+    -
+      template: disable_autofailover
+      wait: true

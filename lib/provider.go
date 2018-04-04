@@ -62,8 +62,7 @@ type DockerProvider struct {
 	ActiveContainers map[string]string
 	StartPort        int
 	Opts             *DockerProviderOpts
-	ExposePorts      bool
-	UseNetwork       bool
+	Flags            *TestFlags
 }
 
 type SwarmProvider struct {
@@ -94,15 +93,7 @@ func NewProvider(flags TestFlags, servers []ServerSpec, syncGateways []SyncGatew
 
 	switch providerArgs[0] {
 	case "docker":
-
-		// Create network if specified
-		network := *flags.Network
-		useNetwork := false
-		cm := NewContainerManager(*flags.Client, "docker", network)
-		if network != "" {
-			cm.CreateNetwork(network)
-			useNetwork = true
-		}
+		cm := NewContainerManager(*flags.Client, "docker", *flags.Network)
 
 		if cm.ProviderType == "swarm" { // detected docker client is in a swarm
 			provider = &SwarmProvider{
@@ -115,8 +106,7 @@ func NewProvider(flags TestFlags, servers []ServerSpec, syncGateways []SyncGatew
 					make(map[string]string),
 					startPort,
 					nil,
-					*flags.ExposePorts,
-					useNetwork,
+					&flags,
 				},
 			}
 		} else {
@@ -129,8 +119,7 @@ func NewProvider(flags TestFlags, servers []ServerSpec, syncGateways []SyncGatew
 				make(map[string]string),
 				startPort,
 				nil,
-				*flags.ExposePorts,
-				useNetwork,
+				&flags,
 			}
 		}
 	case "swarm":
@@ -153,8 +142,7 @@ func NewProvider(flags TestFlags, servers []ServerSpec, syncGateways []SyncGatew
 				make(map[string]string),
 				startPort,
 				nil,
-				*flags.ExposePorts,
-				false,
+				&flags,
 			},
 		}
 	case "file":
@@ -321,6 +309,18 @@ func (p *DockerProvider) GetType() string {
 	return p.Cm.ProviderType
 }
 
+func (p *DockerProvider) UseNetwork() bool {
+	return *p.Flags.Network != ""
+}
+
+func (p *DockerProvider) ExposePorts() bool {
+	return *p.Flags.ExposePorts
+}
+
+func (p *DockerProvider) CreateNetwork(name string) {
+	p.Cm.CreateNetwork(name)
+}
+
 func (p *DockerProvider) GetHostAddress(name string) string {
 
 	id, ok := p.ActiveContainers[name]
@@ -339,7 +339,7 @@ func (p *DockerProvider) GetHostAddress(name string) string {
 	chkerr(err)
 
 	var host string
-	if !p.UseNetwork {
+	if !p.UseNetwork() {
 		host = container.NetworkSettings.IPAddress
 	} else {
 		// strip the prefix "/"
@@ -369,8 +369,14 @@ func (p *DockerProvider) ProvideCouchbaseServers(filename *string, servers []Ser
 		*filename = DEFAULT_DOCKER_PROVIDER_CONF
 
 	}
+	// create network if specified
+	if p.UseNetwork() {
+		p.CreateNetwork(*p.Flags.Network)
+	}
+
 	ReadYamlFile(*filename, &providerOpts)
 	p.Opts = &providerOpts
+	ApplyFlagOverrides(*p.Flags.Override, p.Opts)
 	var build = p.Opts.Build
 
 	// start based on number of containers
@@ -393,7 +399,7 @@ func (p *DockerProvider) ProvideCouchbaseServers(filename *string, servers []Ser
 				Ulimits:    p.Opts.Ulimits,
 				Privileged: true,
 			}
-			if p.ExposePorts == true {
+			if p.ExposePorts() == true {
 				hostConfig.PortBindings = portBindings
 			}
 
@@ -420,7 +426,7 @@ func (p *DockerProvider) ProvideCouchbaseServers(filename *string, servers []Ser
 				strings.ToLower(osPath))
 			exists := p.Cm.CheckImageExists(imgName)
 
-			if exists == false {
+			if exists == false || (p.Opts.BuildUrlOverride != "") {
 
 				var buildArgs = BuildArgsForVersion(p.Opts)
 				var contextDir = fmt.Sprintf("containers/couchbase/%s/", osPath)
@@ -518,7 +524,7 @@ func (p *DockerProvider) StartMobileContainer(containerName string, config docke
 
 	// If network is not provided, link pairs so that the Sync Gateway container can talk to server
 	var linkPairs []string
-	if !p.UseNetwork {
+	if !p.UseNetwork() {
 		linkPairsString := p.GetLinkPairs()
 		linkPairs = strings.Split(linkPairsString, ",")
 	} else {
@@ -690,7 +696,7 @@ func (p *SwarmProvider) ProvideCouchbaseServer(serverName string, portOffset int
 		swarm.PortConfig{},
 	}
 
-	if p.ExposePorts {
+	if p.ExposePorts() {
 		portConfig[0].TargetPort = 8091
 		portConfig[0].PublishedPort = uint32(portOffset)
 	}
@@ -702,7 +708,7 @@ func (p *SwarmProvider) ProvideCouchbaseServer(serverName string, portOffset int
 		Privileged: true,
 	}
 
-	if p.ExposePorts {
+	if p.ExposePorts() {
 		hostConfig.PortBindings = portBindings
 	}
 
@@ -747,10 +753,23 @@ func (p *SwarmProvider) ProvideCouchbaseServer(serverName string, portOffset int
 
 	serviceName := strings.Replace(serverName, ".", "-", -1)
 	containerSpec := swarm.ContainerSpec{Image: imgName}
-	placement := swarm.Placement{Constraints: []string{"node.labels.zone == " + zone}}
-	taskSpec := swarm.TaskSpec{ContainerSpec: &containerSpec, Placement: &placement}
+	taskSpec := swarm.TaskSpec{ContainerSpec: &containerSpec}
+	endpointSpec := swarm.EndpointSpec{}
+
+	// put on ingress network
+	networks := []swarm.NetworkAttachmentConfig{}
+	if p.ExposePorts() {
+		networks = append(networks, swarm.NetworkAttachmentConfig{Target: "ingress"})
+		endpointSpec = swarm.EndpointSpec{Ports: portConfig}
+	}
+
+	if p.Flags.Network != nil {
+		network := swarm.NetworkAttachmentConfig{Target: *p.Flags.Network}
+		networks = append(networks, network)
+		taskSpec.Networks = networks
+	}
 	annotations := swarm.Annotations{Name: serviceName}
-	endpointSpec := swarm.EndpointSpec{Ports: portConfig}
+
 	spec := swarm.ServiceSpec{
 		Annotations:  annotations,
 		TaskTemplate: taskSpec,
@@ -847,7 +866,11 @@ func (p *SwarmProvider) GetHostAddress(name string) string {
 
 	container, err := client.InspectContainer(id)
 	chkerr(err)
-	ipAddress = container.NetworkSettings.Networks["ingress"].IPAddress
+	network := "ingress"
+	if p.Flags.Network != nil {
+		network = *p.Flags.Network
+	}
+	ipAddress = container.NetworkSettings.Networks[network].IPAddress
 
 	return ipAddress
 }
@@ -974,6 +997,10 @@ func versionFlavor(ver string) string {
 		return "spock"
 	case strings.Index(ver, "5.0") == 0:
 		return "spock"
+	case strings.Index(ver, "5.1") == 0:
+		return "spock"
+	case strings.Index(ver, "5.5") == 0:
+                return "vulcan"
 	}
 	return "spock"
 }

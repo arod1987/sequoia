@@ -14,7 +14,6 @@ package sequoia
 
 import (
 	"fmt"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,50 +32,6 @@ type Scope struct {
 	Rest     RestClient
 }
 
-func ApplyOverrides(overrides string, spec *ScopeSpec) {
-	parts := strings.Split(overrides, ",")
-	for _, component := range parts {
-		subparts := strings.Split(component, ":")
-		if len(subparts) > 2 {
-			// rejoin if already had colon
-			subparts = []string{subparts[0],
-				strings.Join(subparts[1:], ":"),
-			}
-		}
-		if len(subparts) == 2 {
-			key := subparts[0]
-			vals := strings.Split(subparts[1], ".")
-
-			switch key {
-			case "servers": // server override
-				for i, server := range spec.Servers {
-					if server.Name == vals[0] {
-						attrs := strings.Split(vals[1], "=")
-						_k := ToCamelCase(attrs[0])
-						_v := attrs[1]
-
-						// reflect to spec field
-						rspec := reflect.ValueOf(&server)
-						el := rspec.Elem()
-						val := el.FieldByName(_k)
-						switch val.Kind() {
-						case reflect.Uint8:
-							// update fuild as uint
-							u, _ := strconv.ParseUint(_v, 10, 8)
-							val.SetUint(u)
-						case reflect.String:
-							// update fuild as string
-							val.SetString(_v)
-						}
-						spec.Servers[i] = server
-					}
-				}
-			} // TODO: add in bucket, ddoc overrides
-		}
-	}
-
-}
-
 func NewScope(flags TestFlags, cm *ContainerManager) Scope {
 
 	// init from yaml or ini
@@ -84,7 +39,7 @@ func NewScope(flags TestFlags, cm *ContainerManager) Scope {
 
 	// apply overrides
 	if params := flags.Override; params != nil {
-		ApplyOverrides(*params, &spec)
+		ApplyFlagOverrides(*params, &spec)
 		ConfigureSpec(&spec)
 	}
 
@@ -127,6 +82,20 @@ func NewScope(flags TestFlags, cm *ContainerManager) Scope {
 				spec.Servers[i].FTSPort = "8094"
 			}
 		}
+		if spec.Servers[i].EventingPort == "" {
+			if provider.GetType() == "dev" {
+				spec.Servers[i].EventingPort = fmt.Sprintf("%d", 9200+i)
+			} else {
+				spec.Servers[i].EventingPort = "8096"
+			}
+		}
+		if spec.Servers[i].AnalyticsPort == "" {
+			if provider.GetType() == "dev" {
+				spec.Servers[i].AnalyticsPort = fmt.Sprintf("%d", 9200+i)
+			} else {
+				spec.Servers[i].AnalyticsPort = "8095"
+			}
+		}
 	}
 	var loops = 0
 	if *flags.Continue == true {
@@ -158,6 +127,37 @@ func (s *Scope) SetupServer() {
 	s.RebalanceClusters()
 	s.CreateBuckets()
 	s.CreateViews()
+}
+
+func (s *Scope) SetupMobile() {
+	waitForResources := false
+
+	// Setup Sync Gateways
+	if len(s.Spec.SyncGateways) > 0 {
+		s.Provider.ProvideSyncGateways(s.Spec.SyncGateways)
+		waitForResources = true
+	}
+
+	// Setup Accels
+	if len(s.Spec.Accels) > 0 {
+		s.Provider.ProvideAccels(s.Spec.Accels)
+		waitForResources = true
+	}
+
+	// Wait for Sync Gateways / Accels to be available
+	if waitForResources {
+		s.WaitForMobile()
+	}
+
+	// If load balancer is defined in scope
+	// Add Sync Gateway to the load balancer
+	if s.Spec.LoadBalancer.Name != "" {
+		s.Provider.ProvideLoadBalancer(s.Spec.LoadBalancer)
+	}
+
+	if waitForResources {
+		s.WriteHostConfig()
+	}
 }
 
 // WriteHostConfig writes a json representation of the topology
@@ -209,6 +209,13 @@ func (s *Scope) WaitForServers() {
 	waitForServersOp := func(name string, server *ServerSpec, done chan bool) {
 
 		ip := s.Provider.GetHostAddress(name)
+		parts := strings.Split(ip, ",")
+                prefix := parts[0]
+                if prefix == "syncgateway" || prefix == "elasticsearch" {
+                        if len(parts) > 1 {
+                                ip = parts[1]
+			}
+		}
 		ipPort := strings.Split(ip, ":")
 		if len(ipPort) == 1 {
 			// use default port
@@ -323,6 +330,11 @@ func (s *Scope) InitNodes() {
 
 	initNodesOp := func(name string, server *ServerSpec, done chan bool) {
 		ip := s.Provider.GetHostAddress(name)
+		parts := strings.Split(ip, ",")
+		prefix := parts[0]
+                if prefix == "syncgateway" || prefix == "elasticsearch" {
+			return
+		}
 		command := []string{"node-init",
 			"-c", ip,
 			"-u", server.RestUsername,
@@ -513,6 +525,12 @@ func (s *Scope) AddNodes() {
 		orchestrator := server.Names[0]
 		orchestratorIp := s.Provider.GetHostAddress(orchestrator)
 		ip := s.Provider.GetHostAddress(name)
+
+		parts := strings.Split(ip, ",")
+                prefix := parts[0]
+                if prefix == "syncgateway" || prefix == "elasticsearch" {
+                        return
+                }
 
 		if name == orchestrator {
 			return // not adding self
@@ -878,6 +896,12 @@ func (s *Scope) RemoveNodes() {
 		orchestrator := server.Names[0]
 		orchestratorIp := s.Provider.GetHostAddress(orchestrator)
 		ip := s.Provider.GetHostAddress(name)
+		
+		parts := strings.Split(ip, ",")
+                prefix := parts[0]
+                if prefix == "syncgateway" || prefix == "elasticsearch" {
+                        return
+                }
 
 		if name == orchestrator {
 			return // not removing self

@@ -35,7 +35,7 @@ buckets:
 servers: # each server tag represents a cluster
   -
       name: local
-      count: 4
+      count: 5
       ram: 80%
       index_ram: 50%
       #index_storage: plasma

@@ -41,6 +41,8 @@ type ServerSpec struct {
 	ViewPort     string `yaml:"view_port"`
 	FTSPort      string `yaml:"fts_port"`
 	QueryPort    string `yaml:"query_port"`
+	EventingPort string `yaml:"eventing_port"`
+	AnalyticsPort   string  `yaml:"analytics_port"`
 	InitNodes    uint8  `yaml:"init_nodes"`
 	DataPath     string `yaml:"data_path"`
 	IndexPath    string `yaml:"index_path"`
@@ -103,17 +105,41 @@ func (s *ServerSpec) InitNodeServices() {
 	numQueryNodes := s.Services["query"]
 	numFtsNodes := s.Services["fts"]
 	numDataNodes := s.Services["data"]
+	numEventingNodes := s.Services["eventing"]
+	numAnalyticsNodes := s.Services["analytics"]
 	customIndexStart := s.Services["index_start"]
 	customQueryStart := s.Services["query_start"]
 	customFtsStart := s.Services["fts_start"]
+	customEventingStart := s.Services["eventing_start"]
+	customAnalyticsStart := s.Services["analytics_start"]
 
 	s.NodeServices = make(map[string][]string)
 
 	// Spread Strategy
 	// make first set of nodes data
-	// and second set index to avoid
+	// and second set eventing to avoid
 	// overlapping if possible when specific
 	// number of service types provided
+
+	analyticsStartPos := numNodes - numQueryNodes - numIndexNodes - numFtsNodes - numEventingNodes - numAnalyticsNodes
+	if customAnalyticsStart > 0 {
+	    // override
+	    analyticsStartPos = customAnalyticsStart - 1
+	}
+	if customAnalyticsStart >= numNodes {
+	    analyticsStartPos = 0
+	}
+
+
+	eventingStartPos := numNodes - numQueryNodes - numIndexNodes - numFtsNodes - numEventingNodes
+	if customEventingStart > 0 {
+		// override
+		eventingStartPos = customEventingStart - 1
+	}
+	if eventingStartPos >= numNodes {
+		eventingStartPos = 0
+	}
+
 	indexStartPos := numNodes - numQueryNodes - numIndexNodes - numFtsNodes
 	if customIndexStart > 0 {
 		// override
@@ -146,6 +172,14 @@ func (s *ServerSpec) InitNodeServices() {
 	for i = 0; i < numNodes; i = i + 1 {
 		name := s.Names[i]
 		s.NodeServices[name] = []string{}
+		if i >= analyticsStartPos && numAnalyticsNodes > 0 {
+			s.NodeServices[name] = append(s.NodeServices[name], "analytics")
+			numAnalyticsNodes--
+		}
+		if i >= eventingStartPos && numEventingNodes > 0 {
+			s.NodeServices[name] = append(s.NodeServices[name], "eventing")
+			numEventingNodes--
+		}
 		if i >= indexStartPos && numIndexNodes > 0 {
 			s.NodeServices[name] = append(s.NodeServices[name], "index")
 			numIndexNodes--
@@ -275,6 +309,10 @@ func (s *ScopeSpec) ToAttr(attr string) string {
 		return "QueryPort"
 	case "fts_port":
 		return "FTSPort"
+	case "eventing_port":
+		return "EventingPort"
+	case "analytics_port":
+	    return "AnalyticsPort"
 	}
 
 	return ""

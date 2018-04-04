@@ -1,0 +1,42 @@
+-
+  include: tests/templates/kv.yml, tests/templates/vegeta.yml, tests/templates/n1ql.yml
+
+####### create index for default bucket #####
+- template: cbq
+  requires: "{{eq true .DoOnce}}"
+  args: "'create PRIMARY INDEX on default'"
+  wait: true
+
+############### create and deploy functions ################
+-
+  image: sequoiatools/eventing
+  command: "/eventing.py {{.Nodes | .Service `eventing` | net 0}} {{.RestPort}} bucket_op_function.json {{.RestUsername}} {{.RestPassword}} create_and_deploy"
+-
+  command: "/eventing.py {{.Nodes | .Service `eventing` | net 0}} {{.RestPort}} doc_timer_op.json {{.RestUsername}} {{.RestPassword}} create_and_deploy"
+  wait: true
+
+############### data loading ################
+-
+  image: sequoiatools/populate_data
+  command: "-bucket {{.Bucket}} -count 1000000 -doc travel_sample -user Administrator -pass password -expiry 1200 -ops 150 http://{{.Orchestrator}}:8091"
+  alias: populate_data1
+-
+  command: "-bucket {{.NthBucket 3}} -count 6000000 -doc travel_sample -user Administrator -pass password -expiry 1200 -ops 1000 http://{{.Orchestrator}}:8091"
+  alias: populate_data2
+  wait: true
+
+# stop gideon data loading
+-
+  client:
+    op: rm
+    container: populate_data1
+-
+  client:
+    op: rm
+    container: populate_data2
+
+-
+  image: sequoiatools/cmd
+  entrypoint: sleep
+  command: "600"
+  wait: true
